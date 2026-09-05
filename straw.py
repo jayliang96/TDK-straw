@@ -17,7 +17,16 @@ DEFAULT_MIN_AREA = 5000
 DEFAULT_MORPHOLOGY_KERNEL = 11
 DEFAULT_RANSAC_THRESHOLD = 12.0
 DEFAULT_RANSAC_ITERATIONS = 300
-DEFAULT_MIN_AXIS_RATIO = 1.5
+DEFAULT_MIN_AXIS_RATIO = 1
+DEFAULT_BORDER_MARGIN = 2
+# 影像座標中畫面的縱向為 90 度。機器人對準稻草捧長軸時，
+# 目標軸線應與畫面縱向重合，此時角度誤差為 0。
+DEFAULT_ROBOT_ANGLE = 90.0
+# 可信度三項證據的模糊區間端點，依實測值設定（見 calculate_confidence）。
+DEFAULT_STRAIGHT_FLOOR = 0.5
+DEFAULT_STRAIGHT_TARGET = 0.85
+DEFAULT_ANGLE_SIGMA_LIMIT = 2.0
+DEFAULT_SEED_MARGIN_TARGET = 0.25
 DEFAULT_IMAGE_OUTPUT = "output/straw_detection.png"
 DEFAULT_VIDEO_OUTPUT = "output/straw_detection.mp4"
 
@@ -188,12 +197,65 @@ def fit_line_ransac(
 		"point": point,
 		"direction": direction,
 		"inliers": points[best_inliers],
+		"inlier_mask": best_inliers,
 		"inlier_ratio": float(np.mean(best_inliers)),
 		"error": best_error,
 	}
 
 
-def fit_side_edges(target_mask, seed_direction):
+def fit_straight_segment(
+	points,
+	seed_direction,
+	threshold=DEFAULT_RANSAC_THRESHOLD,
+	iterations=DEFAULT_RANSAC_ITERATIONS,
+):
+	"""從依縱向排序的邊界點中，找出圓柱體真正的直線側邊。
+
+	圓柱體兩端是圓弧，它們位於序列的頭尾。先用 RANSAC 找出符合同一
+	條直線的點，再取其中最長的一段連續內點重新擬合：圓弧會持續偏離
+	直線，不可能落在連續內點區段裡，因此自然被截掉。
+
+	取「連續」而不是只取內點，是因為兩端圓弧偶爾會正好擦過直線，
+	造成兩段直邊中間夾著圓弧的假直線。
+	"""
+	points = np.asarray(points, dtype=np.float32)
+	initial_fit = fit_line_ransac(points, seed_direction, threshold, iterations)
+	if initial_fit is None:
+		return None
+
+	# 搜尋最長的連續內點區段；末尾補一個 False 讓最後一段也能收尾。
+	best_start = 0
+	best_length = 0
+	run_start = None
+	for index, is_inlier in enumerate(np.append(initial_fit["inlier_mask"], False)):
+		if is_inlier:
+			if run_start is None:
+				run_start = index
+		elif run_start is not None:
+			if index - run_start > best_length:
+				best_start = run_start
+				best_length = index - run_start
+			run_start = None
+
+	if best_length < 5:
+		return None
+
+	segment = points[best_start:best_start + best_length]
+	segment_fit = fit_line_ransac(segment, seed_direction, threshold, iterations)
+	if segment_fit is None:
+		return None
+
+	# inlier_ratio 保留整體擬合的數值，才能反映這個種子方向好不好；
+	# 重新擬合後的內點率幾乎恆為 1，沒有區別力。
+	segment_fit["inlier_ratio"] = initial_fit["inlier_ratio"]
+	segment_fit["segment"] = segment
+	segment_fit["straight_ratio"] = best_length / float(len(points))
+	return segment_fit
+
+
+def fit_side_edges(
+	target_mask, seed_direction, border_margin=DEFAULT_BORDER_MARGIN
+):
 	"""從 mask 輪廓的左右邊界擬合兩條側邊，並將向量相加。
 
 	seed_direction 只用來建立物體的初始縱向座標，最後方向由左右側邊
@@ -207,35 +269,48 @@ def fit_side_edges(target_mask, seed_direction):
 
 	contour = max(contours, key=cv2.contourArea)
 	contour_points = contour[:, 0, :].astype(np.float32)
+
+	# 目標超出畫面時，輪廓會沿著影像邊界走一整段。
+	# 那是裁切痕跡，不是稻草捧的真實邊緣，必須先剔除，
+	# 否則會被當成側邊候選點，讓 RANSAC 擬出一條沿著畫面邊緣的假側邊。
+	height, width = target_mask.shape[:2]
+	on_border = (
+		(contour_points[:, 0] <= border_margin)
+		| (contour_points[:, 0] >= width - 1 - border_margin)
+		| (contour_points[:, 1] <= border_margin)
+		| (contour_points[:, 1] >= height - 1 - border_margin)
+	)
+	border_ratio = float(np.mean(on_border))
+	contour_points = contour_points[~on_border]
+	if len(contour_points) < 20:
+		return None
+
 	center = contour_points.mean(axis=0)
 	axis = np.asarray(seed_direction, dtype=np.float32)
 	axis /= np.linalg.norm(axis)
 	perpendicular = np.array([-axis[1], axis[0]], dtype=np.float32)
 
-	# 將輪廓點投影到縱向和橫向座標，只使用中間 50%，排除兩端圓弧。
+	# 將輪廓點投影到縱向和橫向座標，涵蓋整個縱向範圍。
+	# 不再用固定的中間 50%：那是依點數分位而非座標範圍，而圓弧上的
+	# 輪廓點比直邊密集，分位區間會被拉往圓弧那一側。圓弧的排除
+	# 改由 fit_straight_segment 負責。
 	longitudinal = (contour_points - center) @ axis
 	lateral = (contour_points - center) @ perpendicular
-	long_min, long_max = np.percentile(longitudinal, [25, 75])
-	valid = (longitudinal >= long_min) & (longitudinal <= long_max)
-	valid_points = contour_points[valid]
-	valid_longitudinal = longitudinal[valid]
-	valid_lateral = lateral[valid]
-	if len(valid_points) < 20:
+	long_min = float(longitudinal.min())
+	long_max = float(longitudinal.max())
+	if long_max - long_min < 1.0:
 		return None
 
 	# 每個縱向切片取邊界附近多個點的中位數，不讓單一毛刺決定邊界。
-	bin_edges = np.linspace(long_min, long_max, 21)
+	bin_edges = np.linspace(long_min, long_max, 41)
 	left_points = []
 	right_points = []
 	for lower, upper in zip(bin_edges[:-1], bin_edges[1:]):
-		in_bin = (
-			(valid_longitudinal >= lower)
-			& (valid_longitudinal <= upper)
-		)
+		in_bin = (longitudinal >= lower) & (longitudinal <= upper)
 		if not np.any(in_bin):
 			continue
-		bin_points = valid_points[in_bin]
-		bin_lateral = valid_lateral[in_bin]
+		bin_points = contour_points[in_bin]
+		bin_lateral = lateral[in_bin]
 		boundary_count = max(3, int(np.ceil(len(bin_points) * 0.08)))
 		left_boundary = bin_points[np.argsort(bin_lateral)[:boundary_count]]
 		right_boundary = bin_points[np.argsort(bin_lateral)[-boundary_count:]]
@@ -245,8 +320,8 @@ def fit_side_edges(target_mask, seed_direction):
 	if len(left_points) < 5 or len(right_points) < 5:
 		return None
 
-	left_fit = fit_line_ransac(left_points, axis)
-	right_fit = fit_line_ransac(right_points, axis)
+	left_fit = fit_straight_segment(left_points, axis)
+	right_fit = fit_straight_segment(right_points, axis)
 	if left_fit is None or right_fit is None:
 		return None
 	left_point = left_fit["point"]
@@ -260,26 +335,27 @@ def fit_side_edges(target_mask, seed_direction):
 		return None
 	summed_direction /= np.linalg.norm(summed_direction)
 
-	def line_endpoints(point, direction):
-		start = point + direction * (
-			long_min - np.dot(point - center, direction)
-		)
-		end = point + direction * (
-			long_max - np.dot(point - center, direction)
-		)
+	def line_endpoints(fit):
+		"""將擬合線截在這條側邊實際的直線段範圍內。"""
+		projections = (fit["segment"] - center) @ axis
+		point = fit["point"]
+		direction = fit["direction"]
+		offset = np.dot(point - center, direction)
+		start = point + direction * (float(projections.min()) - offset)
+		end = point + direction * (float(projections.max()) - offset)
 		return start, end
 
-	left_start, left_end = line_endpoints(left_point, left_direction)
-	right_start, right_end = line_endpoints(right_point, right_direction)
+	left_start, left_end = line_endpoints(left_fit)
+	right_start, right_end = line_endpoints(right_fit)
 	# 兩條側邊各自取中點，再取兩個中點的中點，作為梯形中心。
 	left_middle = (left_start + left_end) / 2.0
 	right_middle = (right_start + right_end) / 2.0
 	side_center = (left_middle + right_middle) / 2.0
-	# 目前側邊只取物體中間 50%，乘以 2 估計整個縱向長度。
+	# 側邊已是實際量到的直線段，直接取兩邊平均長度，不再估算全長。
 	long_side = (
 		np.linalg.norm(left_end - left_start)
 		+ np.linalg.norm(right_end - right_start)
-	) / 2.0 * 2.0
+	) / 2.0
 	left_angle = float(np.degrees(np.arctan2(left_direction[1], left_direction[0])))
 	right_angle = float(np.degrees(np.arctan2(right_direction[1], right_direction[0])))
 	summed_angle = float(
@@ -301,10 +377,84 @@ def fit_side_edges(target_mask, seed_direction):
 		"left_angle": left_angle,
 		"right_angle": right_angle,
 		"side_angle_difference": axis_angle_difference(left_angle, right_angle),
+		"border_ratio": border_ratio,
+		"straight_ratio": (
+			left_fit["straight_ratio"] + right_fit["straight_ratio"]
+		) / 2.0,
+		"left_straight_ratio": left_fit["straight_ratio"],
+		"right_straight_ratio": right_fit["straight_ratio"],
+		"left_error": left_fit["error"],
+		"right_error": right_fit["error"],
+		"left_sample_count": int(len(left_fit["segment"])),
+		"right_sample_count": int(len(right_fit["segment"])),
+		"left_length": float(np.linalg.norm(left_end - left_start)),
+		"right_length": float(np.linalg.norm(right_end - right_start)),
 		"left_inlier_ratio": left_fit["inlier_ratio"],
 		"right_inlier_ratio": right_fit["inlier_ratio"],
 		"angle": summed_angle,
 	}
+
+
+def side_straightness(side_edges):
+	"""兩條側邊中較差的那條的直線段佔比。
+
+	取最小而非平均：一邊擬得完美、另一邊是垃圾，不應該被平均成看起來
+	可以接受的分數。
+	"""
+	return min(
+		side_edges["left_straight_ratio"], side_edges["right_straight_ratio"]
+	)
+
+
+def estimate_angle_sigma(side_edges):
+	"""估計最終角度的標準誤，單位為度。
+
+	直線擬合的斜率標準誤約為 殘差 * sqrt(12) / (線段長 * sqrt(點數))：線段
+	越長、取樣點越多、點越貼合直線，方向就釘得越緊。左右兩條獨立擬合後
+	取平均，誤差再除以 sqrt(2)。
+	"""
+	sigmas = []
+	for side in ("left", "right"):
+		length = max(side_edges["%s_length" % side], 1.0)
+		count = max(side_edges["%s_sample_count" % side], 2)
+		sigmas.append(
+			np.degrees(
+				side_edges["%s_error" % side]
+				* np.sqrt(12.0)
+				/ (length * np.sqrt(count))
+			)
+		)
+	return float(np.mean(sigmas) / np.sqrt(2.0))
+
+
+def calculate_confidence(side_edges, seed_margin):
+	"""以三項獨立證據評估方向可信度，取最弱的一項。
+
+	證據：兩側都找到夠長的直線段，代表擬的是真正的側邊而不是圓弧。
+	精度：角度本身的標準誤，回答「這個角度釘得多緊」。
+	種子：主軸與次軸兩個候選的分數差距，守住 90 度翻轉這個最壞的失效
+	模式；目標若是正矩形，兩個方向都有直邊，前兩項都不會示警。
+
+	取最小值而非相乘：相乘會讓三項都尚可的結果被壓到 0.6 以下，失去可
+	讀性；取最小值則能直接看出是哪一項在拖。
+
+	刻意不使用左右側邊夾角：稻草捆的兩側邊在透視下本來就會收斂，實測
+	正確偵測的夾角反而比錯誤的大（11~20 度 vs 2~11 度），拿它當懲罰項
+	會壓低正確結果的分數。
+	"""
+	evidence = (side_straightness(side_edges) - DEFAULT_STRAIGHT_FLOOR) / (
+		DEFAULT_STRAIGHT_TARGET - DEFAULT_STRAIGHT_FLOOR
+	)
+	precision = (
+		1.0 - estimate_angle_sigma(side_edges) / DEFAULT_ANGLE_SIGMA_LIMIT
+	)
+	margin = seed_margin / DEFAULT_SEED_MARGIN_TARGET
+	terms = {
+		"evidence": float(np.clip(evidence, 0.0, 1.0)),
+		"precision": float(np.clip(precision, 0.0, 1.0)),
+		"seed_margin": float(np.clip(margin, 0.0, 1.0)),
+	}
+	return float(min(terms.values())), terms
 
 
 def analyze_target(target_mask, min_axis_ratio=DEFAULT_MIN_AXIS_RATIO):
@@ -331,24 +481,38 @@ def analyze_target(target_mask, min_axis_ratio=DEFAULT_MIN_AXIS_RATIO):
 		return None
 
 	# PCA 只用來提供找左右側邊的初始座標系；實際方向由兩側邊向量和決定。
-	side_edges = fit_side_edges(target_mask, pca_vector)
-	if side_edges is None:
+	# 目標接近方形時 PCA 分不出長短軸，主軸可能剛好指向側邊的垂直
+	# 方向，側邊就會汿成上下兩端。主軸與次軸各擬合一次，取內點率高者：
+	# 內點率能分辨真實側邊與非側邊，左右夾角則不行（透視收斂會讓正確
+	# 解的夾角反而較大）。
+	perpendicular_vector = np.array(
+		[-pca_vector[1], pca_vector[0]], dtype=np.float32
+	)
+	candidates = []
+	for seed_vector in (pca_vector, perpendicular_vector):
+		fitted = fit_side_edges(target_mask, seed_vector)
+		if fitted is not None:
+			candidates.append((side_straightness(fitted), fitted))
+	if not candidates:
 		# 側邊是中心與方向的必要資料，失敗時不能用外接矩形中心冒充。
 		return None
+
+	candidates.sort(key=lambda item: item[0], reverse=True)
+	best_score, side_edges = candidates[0]
+	runner_up_score = candidates[1][0] if len(candidates) > 1 else 0.0
+	seed_margin = (
+		(best_score - runner_up_score) / best_score
+		if best_score > 1e-6
+		else 0.0
+	)
 
 	direction = side_edges["direction"]
 	actual_angle = side_edges["angle"]
 	target_center = tuple(side_edges["center"])
 
-	# 左右邊越平行、RANSAC 內點越多，代表這次方向越可信。
-	side_confidence = max(
-		0.0, 1.0 - side_edges["side_angle_difference"] / 30.0
+	confidence, confidence_terms = calculate_confidence(
+		side_edges, seed_margin
 	)
-	inlier_confidence = (
-		side_edges["left_inlier_ratio"]
-		+ side_edges["right_inlier_ratio"]
-	) / 2.0
-	confidence = float(side_confidence * inlier_confidence)
 
 	return {
 		"center": target_center,
@@ -356,7 +520,12 @@ def analyze_target(target_mask, min_axis_ratio=DEFAULT_MIN_AXIS_RATIO):
 		"angle": float(actual_angle),
 		"pca_angle": pca_angle,
 		"axis_ratio": axis_ratio,
+		"border_ratio": side_edges["border_ratio"],
+		"straight_ratio": side_edges["straight_ratio"],
 		"confidence": float(confidence),
+		"confidence_terms": confidence_terms,
+		"angle_sigma": estimate_angle_sigma(side_edges),
+		"seed_margin": float(seed_margin),
 		"direction": direction,
 		"side_edges": side_edges,
 		"eigenvalues": eigenvalues,
@@ -364,12 +533,14 @@ def analyze_target(target_mask, min_axis_ratio=DEFAULT_MIN_AXIS_RATIO):
 	}
 
 
-def calculate_heading_error(target_angle, robot_angle=0.0):
+def calculate_heading_error(target_angle, robot_angle=DEFAULT_ROBOT_ANGLE):
 	"""回傳 [-90, 90) 度內的無方向軸線角度誤差。"""
 	return (target_angle - robot_angle + 90.0) % 180.0 - 90.0
 
 
-def make_visualization(mask, target_mask, result, robot_angle=0.0):
+def make_visualization(
+	mask, target_mask, result, robot_angle=DEFAULT_ROBOT_ANGLE
+):
 	"""繪製輪廓、左右側邊，以及兩側邊向量和的實際方向。"""
 	visualization = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 	visualization[target_mask > 0] = (0, 180, 255)
@@ -649,7 +820,7 @@ def parse_args():
 	parser.add_argument(
 		"--robot-angle",
 		type=float,
-		default=0.0,
+		default=DEFAULT_ROBOT_ANGLE,
 		help="機器人前進方向在影像座標中的角度",
 	)
 	return parser.parse_args()
@@ -715,6 +886,14 @@ def main():
 	print(f"兩側邊向量和角度: {result['angle']:.1f} deg")
 	print(f"機器人角度誤差: {heading_error:.1f} deg")
 	print(f"主軸細長比: {result['axis_ratio']:.2f}")
+	print(f"輪廓貼齊畫面邊界比例: {result['border_ratio']:.1%}")
+	print(f"側邊直線段佔比: {result['straight_ratio']:.1%}")
+	print(f"角度標準誤: {result['angle_sigma']:.2f} deg")
+	terms = result["confidence_terms"]
+	print(
+		f"可信度細項: 證據 {terms['evidence']:.2f} / "
+		f"精度 {terms['precision']:.2f} / 種子 {terms['seed_margin']:.2f}"
+	)
 	print(f"方向可信度: {result['confidence']:.2f}")
 	print(f"標註圖已儲存: {args.output}")
 
