@@ -17,9 +17,8 @@ DEFAULT_MIN_AREA = 5000
 DEFAULT_MORPHOLOGY_KERNEL = 11
 DEFAULT_RANSAC_THRESHOLD = 12.0
 DEFAULT_RANSAC_ITERATIONS = 300
-DEFAULT_MIN_AXIS_RATIO = 1
 DEFAULT_BORDER_MARGIN = 2
-# 影像座標中畫面的縱向為 90 度。機器人對準稻草捧長軸時，
+# 影像座標中畫面的縱向為 90 度。機器人對準稻草捆長軸時，
 # 目標軸線應與畫面縱向重合，此時角度誤差為 0。
 DEFAULT_ROBOT_ANGLE = 90.0
 # 可信度三項證據的模糊區間端點，依實測值設定（見 calculate_confidence）。
@@ -156,32 +155,46 @@ def fit_line_ransac(
 	if len(points) < 5:
 		return None
 
+	# 所有取樣配對一次算完。候選數和點數都只有數十，(候選 x 點) 的距離
+	# 矩陣很小，用矩陣運算取代逐次迴圈可避開 numpy 的單次呼叫開銷。
 	rng = np.random.default_rng(42)
-	best_inliers = None
-	best_error = np.inf
-	for _ in range(iterations):
-		first, second = points[rng.choice(len(points), 2, replace=False)]
-		line_vector = second - first
-		length = np.linalg.norm(line_vector)
-		if length < 1.0:
-			continue
+	count = len(points)
+	first_index = rng.integers(0, count, size=iterations)
+	# 加上 1..count-1 的位移再取模，保證配對的兩點不同。
+	second_index = (
+		first_index + rng.integers(1, count, size=iterations)
+	) % count
 
-		line_vector /= length
-		distance = np.abs(
-			(line_vector[0] * (points[:, 1] - first[1]))
-			- (line_vector[1] * (points[:, 0] - first[0]))
-		)
-		inliers = distance <= threshold
-		inlier_count = int(np.count_nonzero(inliers))
-		inlier_error = float(np.mean(distance[inliers])) if inlier_count else np.inf
-		if best_inliers is None or (inlier_count, -inlier_error) > (
-			int(np.count_nonzero(best_inliers)),
-			-best_error,
-		):
-			best_inliers = inliers
-			best_error = inlier_error
+	first_points = points[first_index]
+	line_vectors = points[second_index] - first_points
+	lengths = np.linalg.norm(line_vectors, axis=1)
+	usable = lengths >= 1.0
+	if not np.any(usable):
+		return None
 
-	if best_inliers is None or np.count_nonzero(best_inliers) < 5:
+	first_points = first_points[usable]
+	line_vectors = line_vectors[usable] / lengths[usable, None]
+
+	# 每個候選線到每個點的垂直距離，形狀為 (候選數, 點數)。
+	deltas = points[None, :, :] - first_points[:, None, :]
+	distances = np.abs(
+		line_vectors[:, None, 0] * deltas[:, :, 1]
+		- line_vectors[:, None, 1] * deltas[:, :, 0]
+	)
+	inlier_masks = distances <= threshold
+	inlier_counts = inlier_masks.sum(axis=1)
+	inlier_sums = np.where(inlier_masks, distances, 0.0).sum(axis=1)
+	errors = np.where(
+		inlier_counts > 0,
+		inlier_sums / np.maximum(inlier_counts, 1),
+		np.inf,
+	)
+
+	# 先比內點數（多者優先），內點數相同再比平均殘差（小者優先）。
+	best = int(np.lexsort((errors, -inlier_counts))[0])
+	best_inliers = inlier_masks[best]
+	best_error = float(errors[best])
+	if np.count_nonzero(best_inliers) < 5:
 		return None
 
 	line = cv2.fitLine(
@@ -253,13 +266,13 @@ def fit_straight_segment(
 	return segment_fit
 
 
-def fit_side_edges(
-	target_mask, seed_direction, border_margin=DEFAULT_BORDER_MARGIN
-):
-	"""從 mask 輪廓的左右邊界擬合兩條側邊，並將向量相加。
+def extract_contour_points(target_mask, border_margin=DEFAULT_BORDER_MARGIN):
+	"""取出目標輪廓，並剔除貼齊畫面邊界的點。
 
-	seed_direction 只用來建立物體的初始縱向座標，最後方向由左右側邊
-	的向量和決定。這可以降低透視造成單一側邊偏移的影響。
+	結果只取決於 mask，與種子方向無關，因此每幀只需計算一次，
+	供兩個種子方向共用。
+
+	回傳 (輪廓點, 貼邊比例)；輪廓不存在或點數不足時回傳 None。
 	"""
 	contours, _ = cv2.findContours(
 		target_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
@@ -271,7 +284,7 @@ def fit_side_edges(
 	contour_points = contour[:, 0, :].astype(np.float32)
 
 	# 目標超出畫面時，輪廓會沿著影像邊界走一整段。
-	# 那是裁切痕跡，不是稻草捧的真實邊緣，必須先剔除，
+	# 那是裁切痕跡，不是稻草捆的真實邊緣，必須先剔除，
 	# 否則會被當成側邊候選點，讓 RANSAC 擬出一條沿著畫面邊緣的假側邊。
 	height, width = target_mask.shape[:2]
 	on_border = (
@@ -285,6 +298,15 @@ def fit_side_edges(
 	if len(contour_points) < 20:
 		return None
 
+	return contour_points, border_ratio
+
+
+def fit_side_edges(contour_points, border_ratio, seed_direction):
+	"""從輪廓的左右邊界擬合兩條側邊，並將向量相加。
+
+	seed_direction 只用來建立物體的初始縱向座標，最後方向由左右側邊
+	的向量和決定。這可以降低透視造成單一側邊偏移的影響。
+	"""
 	center = contour_points.mean(axis=0)
 	axis = np.asarray(seed_direction, dtype=np.float32)
 	axis /= np.linalg.norm(axis)
@@ -457,7 +479,7 @@ def calculate_confidence(side_edges, seed_margin):
 	return float(min(terms.values())), terms
 
 
-def analyze_target(target_mask, min_axis_ratio=DEFAULT_MIN_AXIS_RATIO):
+def analyze_target(target_mask):
 	"""估計目標中心、實際主軸角度、方向向量與可信度。"""
 	# 透視會讓稻草捆的矩形變成梯形，因此用所有前景像素做 PCA，
 	# 取得整個目標的主要分布方向，作為實際長軸方向。
@@ -469,16 +491,14 @@ def analyze_target(target_mask, min_axis_ratio=DEFAULT_MIN_AXIS_RATIO):
 	pca_vector = eigenvectors[0]
 	pca_angle = float(np.degrees(np.arctan2(pca_vector[1], pca_vector[0])))
 
-	# 目標被畫面邊界截斷時，mask 會接近正方形，主軸方向純粹是雜訊。
-	# 形狀不夠細長就不輸出方向，避免給控制端一個看似合理卻完全錯誤的角度。
+	# 主軸與次軸的變異比，接近 1 代表形狀接近方形。純粹是診斷資訊：
+	# 近似方形造成的 90 度翻轉改由雙種子擬合處理，可信度的種子項會反映。
 	variances = eigenvalues.ravel()
 	minor_variance = float(variances[1])
 	if minor_variance <= 1e-6:
 		axis_ratio = float("inf")
 	else:
 		axis_ratio = float(variances[0]) / minor_variance
-	if axis_ratio < min_axis_ratio:
-		return None
 
 	# PCA 只用來提供找左右側邊的初始座標系；實際方向由兩側邊向量和決定。
 	# 目標接近方形時 PCA 分不出長短軸，主軸可能剛好指向側邊的垂直
@@ -488,9 +508,14 @@ def analyze_target(target_mask, min_axis_ratio=DEFAULT_MIN_AXIS_RATIO):
 	perpendicular_vector = np.array(
 		[-pca_vector[1], pca_vector[0]], dtype=np.float32
 	)
+	extracted = extract_contour_points(target_mask)
+	if extracted is None:
+		return None
+	contour_points, border_ratio = extracted
+
 	candidates = []
 	for seed_vector in (pca_vector, perpendicular_vector):
-		fitted = fit_side_edges(target_mask, seed_vector)
+		fitted = fit_side_edges(contour_points, border_ratio, seed_vector)
 		if fitted is not None:
 			candidates.append((side_straightness(fitted), fitted))
 	if not candidates:
@@ -624,7 +649,7 @@ def process_frame(frame_bgr, args, angle_filter):
 	if component is None:
 		return None
 
-	result = analyze_target(component["mask"], args.min_axis_ratio)
+	result = analyze_target(component["mask"])
 	if result is None:
 		return None
 
@@ -790,12 +815,6 @@ def parse_args():
 		help="有效目標連通區的最小面積",
 	)
 	parser.add_argument(
-		"--min-axis-ratio",
-		type=float,
-		default=DEFAULT_MIN_AXIS_RATIO,
-		help="PCA 主軸與次軸的最小變異比；低於此值視為形狀太接近方形，不輸出方向",
-	)
-	parser.add_argument(
 		"--kernel-size",
 		type=int,
 		default=DEFAULT_MORPHOLOGY_KERNEL,
@@ -852,12 +871,10 @@ def main():
 			"No valid target found. Check the mask or lower --min-area."
 		)
 
-	result = analyze_target(component["mask"], args.min_axis_ratio)
+	result = analyze_target(component["mask"])
 	if result is None:
 		raise RuntimeError(
-			"目標形狀不夠細長（主軸比 < "
-			f"{args.min_axis_ratio}，可用 --min-axis-ratio 調整）"
-			"或無法可靠擬合左右側邊，本幀不輸出中心與方向。"
+			"無法可靠擬合左右側邊，本幀不輸出中心與方向。"
 		)
 
 	# 相機連續取像時，應在影像迴圈外建立並重複使用同一個 filter。
