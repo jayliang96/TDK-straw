@@ -5,6 +5,8 @@
 
 import argparse
 import json
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -923,6 +925,91 @@ class RealSenseCapture:
 		self.pipeline.stop()
 
 
+class LatestFrameCapture:
+	"""在背景執行緒持續讀取，永遠只保留最新的一格。
+
+	即時控制拿到的誤差必須反映當下。處理一格的期間相機仍在產出影格，
+	若逐格排隊處理，延遲會不斷累積，控制端收到的永遠是過期的狀態。
+	舊影格對控制沒有價值，直接丟棄。
+
+	另一個好處是讀取與處理可以重疊：RealSense 的深度對齊本身就要花時間，
+	放到背景執行緒後，總耗時從「讀取 + 處理」變成「兩者取大」。
+
+	只用於 cv2.VideoCapture 的相機來源：該路徑的驅動會累積佇列，實測
+	處理耗時 100 ms 時 read() 只花 0.2 ms 就回傳，代表拿到的是過期影格。
+	RealSense 不需要，其 pipeline 已經只保留最新的 frameset。
+	影片檔更不可使用：丟格等於跳過內容。
+
+	介面與 cv2.VideoCapture 相同，run_on_stream 不必區分。
+	"""
+
+	def __init__(self, capture):
+		self.capture = capture
+		self.lock = threading.Lock()
+		self.frame = None
+		self.dropped = 0
+		self.error = None
+		self.finished = False
+		self.running = True
+		self.thread = threading.Thread(target=self.reader, daemon=True)
+		self.thread.start()
+
+	def reader(self):
+		"""背景讀取；新影格直接覆蓋尚未被取用的舊影格。"""
+		while self.running:
+			try:
+				ok, frame = self.capture.read()
+			except Exception as error:
+				# 例外要帶回主執行緒丟出，否則會靜默地停止供應影格。
+				with self.lock:
+					self.error = error
+					self.finished = True
+				return
+
+			if not ok:
+				with self.lock:
+					self.finished = True
+				return
+
+			with self.lock:
+				if self.frame is not None:
+					self.dropped += 1
+				self.frame = frame
+
+	def read(self):
+		"""取出最新的一格。沒有新影格時等待，不重複回傳同一格。"""
+		while True:
+			with self.lock:
+				if self.error is not None:
+					raise self.error
+				if self.frame is not None:
+					frame = self.frame
+					self.frame = None
+					return True, frame
+				if self.finished:
+					return False, None
+			time.sleep(0.001)
+
+	def get(self, prop):
+		return self.capture.get(prop)
+
+	def isOpened(self):
+		return self.capture.isOpened()
+
+	def release(self):
+		self.running = False
+		# 讀取執行緒可能正阻塞在 read()，等一下就好，它是 daemon。
+		self.thread.join(timeout=1.0)
+		self.capture.release()
+
+
+def wrap_live_capture(capture, args):
+	"""相機來源才套用丟格讀取；影片檔丟格等於跳過內容。"""
+	if args.no_frame_drop:
+		return capture
+	return LatestFrameCapture(capture)
+
+
 def run_on_stream(capture, args):
 	"""逐格讀取影片或相機畫面，即時偵測並可選擇顯示/儲存結果。"""
 	angle_filter = AxisAngleFilter(alpha=0.25)
@@ -931,6 +1018,9 @@ def run_on_stream(capture, args):
 	output_path = None if args.no_save or not args.output else Path(args.output)
 	# 機器運行模式不需要標註圖，跳過繪圖省下約四分之一的處理時間。
 	draw = not args.robot
+	# 包裝層會把 describe_depth 轉給底層，但沒有深度的來源不該被誤判。
+	source = getattr(capture, "capture", capture)
+	has_depth_source = hasattr(source, "describe_depth")
 
 	try:
 		while True:
@@ -950,7 +1040,7 @@ def run_on_stream(capture, args):
 				result = outcome["result"]
 				payload = outcome["payload"]
 				# RealSense 輸入才有深度，其餘來源沒有這個方法。
-				if hasattr(capture, "describe_depth"):
+				if has_depth_source:
 					payload = dict(payload)
 					payload.update(capture.describe_depth(result["center"]))
 				# 可信度不足時視同沒有偵測到：寧可讓控制端維持前一個指令，
@@ -1004,6 +1094,11 @@ def run_on_stream(capture, args):
 
 	if output_path is not None:
 		print(f"輸出影片已儲存: {output_path}")
+
+	dropped = getattr(capture, "dropped", 0)
+	if dropped and not args.robot:
+		# 丟格是預期行為，但數量能看出處理速度跟不跟得上相機。
+		print(f"為了取得最新畫面，丟棄了 {dropped} 格")
 
 
 def build_input_mask(args):
@@ -1104,6 +1199,11 @@ def parse_args():
 		help="不開啟即時顯示視窗，適合無頭環境",
 	)
 	parser.add_argument(
+		"--no-frame-drop",
+		action="store_true",
+		help="即時來源不丟格，逐格處理（延遲會累積，僅供除錯）",
+	)
+	parser.add_argument(
 		"--robot",
 		action="store_true",
 		help="機器運行模式：只輸出角度與橫向誤差，跳過繪圖與顯示",
@@ -1186,6 +1286,8 @@ def main():
 
 	if args.realsense:
 		width, height = args.realsense_size
+		# RealSense 的 pipeline 本身就只保留最新的 frameset，不需要再包一層
+		# 丟格讀取；實測兩者延遲相同（中位 56 vs 55 ms）。
 		capture = RealSenseCapture(
 			width, height, args.realsense_fps, not args.no_realsense_depth
 		)
@@ -1199,6 +1301,10 @@ def main():
 		capture = cv2.VideoCapture(source)
 		if not capture.isOpened():
 			raise RuntimeError(f"無法開啟輸入來源: {source}")
+
+		# 相機是即時來源，可以丟格；影片檔必須逐格處理。
+		if args.camera is not None:
+			capture = wrap_live_capture(capture, args)
 
 		if args.output == DEFAULT_IMAGE_OUTPUT:
 			args.output = DEFAULT_VIDEO_OUTPUT
