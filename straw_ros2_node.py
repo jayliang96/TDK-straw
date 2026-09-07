@@ -42,6 +42,10 @@ class DetectionSettings:
 		self.kernel_size = int(node.get_parameter("kernel_size").value)
 		self.min_area = int(node.get_parameter("min_area").value)
 		self.robot_angle = float(node.get_parameter("robot_angle").value)
+		# process_frame 會用它決定標註圖上的軸線顏色。
+		self.min_confidence = float(
+			node.get_parameter("min_confidence").value
+		)
 
 
 class StrawDetectorNode(Node):

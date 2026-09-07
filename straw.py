@@ -31,6 +31,11 @@ DEFAULT_ROBOT_ANGLE = 90.0
 DEFAULT_FILTER_ALPHA = 0.25
 # 機器運行模式的可信度門檻；錯誤的讀數會直接變成錯誤的動作。
 DEFAULT_MIN_CONFIDENCE = 0.5
+# 標註圖的軸線顏色（BGR）。通過門檻用橘色，未通過維持灰色。
+# 目標區塊本身也是橘色，因此軸線一律先描一圈深色外框才有對比。
+AXIS_COLOUR_PASS = (0, 140, 255)
+AXIS_COLOUR_FAIL = (180, 180, 180)
+AXIS_OUTLINE_COLOUR = (40, 40, 40)
 # RealSense 深度影像為 16UC1，單位公釐。
 DEFAULT_DEPTH_SCALE = 0.001
 DEFAULT_DEPTH_PATCH_RADIUS = 6
@@ -673,7 +678,21 @@ def build_robot_payload(result, errors, image_shape):
 	}
 
 
-def make_visualization(mask, target_mask, result, errors):
+def display_confidence_threshold(args):
+	"""標註圖上判定「通過」所用的門檻。
+
+	--min-confidence 在非機器運行模式預設為 0（不過濾輸出），但標註圖
+	若用 0 會讓每一格都顯示通過，失去意義。因此未過濾時退回
+	DEFAULT_MIN_CONFIDENCE，也就是機器運行模式實際採用的標準。
+	"""
+	if args.min_confidence > 0.0:
+		return args.min_confidence
+	return DEFAULT_MIN_CONFIDENCE
+
+
+def make_visualization(
+	mask, target_mask, result, errors, min_confidence=DEFAULT_MIN_CONFIDENCE
+):
 	"""繪製輪廓、左右側邊，以及兩側邊向量和的實際方向。"""
 	visualization = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 	visualization[target_mask > 0] = (0, 180, 255)
@@ -697,29 +716,36 @@ def make_visualization(mask, target_mask, result, errors):
 	center = (int(round(center_x)), int(round(center_y)))
 	cv2.circle(visualization, center, 8, (0, 0, 255), -1)
 
-	# 灰色雙向箭頭是左右側邊向量相加後的圓柱體實際朝向。
+	# 雙向箭頭是左右側邊向量相加後的圓柱體實際朝向。
+	# 橘色代表可信度通過門檻、這一格會被控制端採用；灰色代表未通過。
+	passed = result["confidence"] >= min_confidence
+	axis_colour = AXIS_COLOUR_PASS if passed else AXIS_COLOUR_FAIL
 	direction = result["direction"]
 	arrow_length = max(result["long_side"] * 0.5, 40.0)
 	start = np.array(center, dtype=np.float32) - direction * arrow_length
 	end = np.array(center, dtype=np.float32) + direction * arrow_length
-	cv2.line(
-		visualization,
-		tuple(np.round(start).astype(int)),
-		tuple(np.round(end).astype(int)),
-		(180, 180, 180),
-		4,
-	)
-	# 兩端都加上箭頭，表示這是沒有正反方向差異的軸線。
-	for point, vector in ((start, direction), (end, -direction)):
-		arrow_tip = point + vector * 28.0
-		cv2.arrowedLine(
+
+	# 先粗後細畫兩次；深色外框讓橘色軸線在同樣是橘色的目標上仍有對比。
+	for colour, thickness in ((AXIS_OUTLINE_COLOUR, 8), (axis_colour, 4)):
+		cv2.line(
 			visualization,
-			tuple(np.round(point).astype(int)),
-			tuple(np.round(arrow_tip).astype(int)),
-			(180, 180, 180),
-			4,
-			tipLength=0.35,
+			tuple(np.round(start).astype(int)),
+			tuple(np.round(end).astype(int)),
+			colour,
+			thickness,
+			lineType=cv2.LINE_AA,
 		)
+		# 兩端都加上箭頭，表示這是沒有正反方向差異的軸線。
+		for point, vector in ((start, direction), (end, -direction)):
+			arrow_tip = point + vector * 28.0
+			cv2.arrowedLine(
+				visualization,
+				tuple(np.round(point).astype(int)),
+				tuple(np.round(arrow_tip).astype(int)),
+				colour,
+				thickness,
+				tipLength=0.35,
+			)
 
 	# 綠色垂直線是機器人中線，橫線標出目標中心離中線多遠。
 	middle_x = visualization.shape[1] // 2
@@ -747,7 +773,8 @@ def make_visualization(mask, target_mask, result, errors):
 		f"機器人角度誤差: {errors['heading_error']:.1f} deg",
 		f"橫向誤差: {errors['lateral_error']:.0f} px "
 		f"({errors['lateral_error_ratio']:+.2f})",
-		f"方向可信度: {result['confidence']:.2f}",
+		f"方向可信度: {result['confidence']:.2f} / 門檻 {min_confidence:.2f}"
+		f"  {'通過' if passed else '未通過'}",
 	]
 	for index, text in enumerate(text_lines):
 		cv2.putText(
@@ -790,7 +817,11 @@ def process_frame(frame_bgr, args, angle_filter, build_visualization=True):
 	visualization = None
 	if build_visualization:
 		visualization = make_visualization(
-			mask, component["mask"], result, errors
+			mask,
+			component["mask"],
+			result,
+			errors,
+			display_confidence_threshold(args),
 		)
 	return {
 		"visualization": visualization,
@@ -1288,17 +1319,18 @@ def parse_args():
 		default=DEFAULT_ROBOT_ANGLE,
 		help="機器人前進方向在影像座標中的角度",
 	)
-	return parser.parse_args()
+	args = parser.parse_args()
+	if args.min_confidence is None:
+		# 機器運行模式的錯誤會直接變成錯誤的動作，預設就要過濾；
+		# 其他模式維持原本不過濾的行為，以免影響既有用法。
+		args.min_confidence = DEFAULT_MIN_CONFIDENCE if args.robot else 0.0
+	return args
 
 
 def main():
 	# 讀取參數，依序完成 mask 清理、目標選取、方向分析與結果輸出。
 	args = parse_args()
 
-	if args.min_confidence is None:
-		# 機器運行模式的錯誤會直接變成錯誤的動作，預設就要過濾；
-		# 其他模式維持原本不過濾的行為，以免影響既有用法。
-		args.min_confidence = DEFAULT_MIN_CONFIDENCE if args.robot else 0.0
 	if args.robot:
 		# 機器上沒有螢幕，也不需要錄影。
 		args.no_display = True
@@ -1358,6 +1390,7 @@ def main():
 		component["mask"],
 		result,
 		errors,
+		display_confidence_threshold(args),
 	)
 
 	save_outputs(
