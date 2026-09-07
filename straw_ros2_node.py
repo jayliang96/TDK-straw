@@ -174,7 +174,10 @@ class StrawDetectorNode(Node):
 			self.get_logger().warn("彩色影像轉換失敗: %s" % error)
 			return
 
-		outcome = process_frame(frame, self.settings, self.angle_filter)
+		# 沒有要發佈標註影像時就不必繪圖，那佔整體約四分之一的時間。
+		outcome = process_frame(
+			frame, self.settings, self.angle_filter, self.publish_annotated
+		)
 		if outcome is None:
 			self.publish_payload({"valid": False}, color_message)
 			return

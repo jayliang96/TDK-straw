@@ -678,9 +678,7 @@ def build_robot_payload(result, errors, image_shape):
 	}
 
 
-def make_visualization(
-	mask, target_mask, result, robot_angle=DEFAULT_ROBOT_ANGLE
-):
+def make_visualization(mask, target_mask, result, errors):
 	"""繪製輪廓、左右側邊，以及兩側邊向量和的實際方向。"""
 	visualization = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 	visualization[target_mask > 0] = (0, 180, 255)
@@ -728,10 +726,6 @@ def make_visualization(
 			tipLength=0.35,
 		)
 
-	errors = calculate_control_errors(
-		result, visualization.shape[1], robot_angle
-	)
-
 	# 綠色垂直線是機器人中線，橫線標出目標中心離中線多遠。
 	middle_x = visualization.shape[1] // 2
 	cv2.line(
@@ -772,11 +766,15 @@ def make_visualization(
 			cv2.LINE_AA,
 		)
 
-	return visualization, errors
+	return visualization
 
 
-def process_frame(frame_bgr, args, angle_filter):
-	"""對單一影格執行 mask 建立、目標選取與方向分析。"""
+def process_frame(frame_bgr, args, angle_filter, build_visualization=True):
+	"""對單一影格執行 mask 建立、目標選取與方向分析。
+
+	build_visualization 為 False 時不繪製標註圖，visualization 會是 None。
+	機器運行模式用不到標註圖，而繪圖佔整體約四分之一的時間。
+	"""
 	lower_bound = np.array(args.lower_hsv, dtype=np.uint8)
 	upper_bound = np.array(args.upper_hsv, dtype=np.uint8)
 	mask = create_color_mask(frame_bgr, lower_bound, upper_bound, args.kernel_size)
@@ -791,15 +789,44 @@ def process_frame(frame_bgr, args, angle_filter):
 		return None
 
 	result = apply_angle_filter(result, angle_filter)
-	visualization, errors = make_visualization(
-		cleaned_mask, component["mask"], result, args.robot_angle
+	errors = calculate_control_errors(
+		result, frame_bgr.shape[1], args.robot_angle
 	)
+	visualization = None
+	if build_visualization:
+		visualization = make_visualization(
+			cleaned_mask, component["mask"], result, errors
+		)
 	return {
 		"visualization": visualization,
 		"result": result,
 		"errors": errors,
 		"payload": build_robot_payload(result, errors, frame_bgr.shape),
 		"component": component,
+	}
+
+
+def build_robot_command(payload):
+	"""機器運行模式的輸出：只留控制迴圈真正會用到的量。
+
+	欄位固定不變，控制端不必判斷欄位在不在。沒有深度時 lateral_error_m
+	為 null，此時改用 lateral_error_ratio（以半個畫面寬為單位）。
+	"""
+	if not payload.get("valid"):
+		return {
+			"valid": False,
+			"heading_error_deg": None,
+			"lateral_error_m": None,
+			"lateral_error_ratio": None,
+		}
+
+	return {
+		"valid": True,
+		"heading_error_deg": payload["heading_error_deg"],
+		"lateral_error_m": (
+			payload["lateral_error_m"] if payload.get("has_depth") else None
+		),
+		"lateral_error_ratio": payload["lateral_error_ratio"],
 	}
 
 
@@ -902,6 +929,8 @@ def run_on_stream(capture, args):
 	writer = None
 	window_name = "TDK Straw Detection"
 	output_path = None if args.no_save or not args.output else Path(args.output)
+	# 機器運行模式不需要標註圖，跳過繪圖省下約四分之一的處理時間。
+	draw = not args.robot
 
 	try:
 		while True:
@@ -909,11 +938,13 @@ def run_on_stream(capture, args):
 			if not ok:
 				break
 
-			outcome = process_frame(frame, args, angle_filter)
+			outcome = process_frame(frame, args, angle_filter, draw)
 			if outcome is None:
 				display = frame
-				if args.emit_json:
-					# 明確送出無效值，控制端才能區分「沒偵測到」與「誤差為 0」。
+				# 明確送出無效值，控制端才能區分「沒偵測到」與「誤差為 0」。
+				if args.robot:
+					emit_payload(build_robot_command({"valid": False}))
+				elif args.emit_json:
 					emit_payload({"valid": False})
 			else:
 				result = outcome["result"]
@@ -922,7 +953,13 @@ def run_on_stream(capture, args):
 				if hasattr(capture, "describe_depth"):
 					payload = dict(payload)
 					payload.update(capture.describe_depth(result["center"]))
-				if args.emit_json:
+				# 可信度不足時視同沒有偵測到：寧可讓控制端維持前一個指令，
+				# 也不要送出一個看似合理但方向可能錯 90 度的誤差。
+				if result["confidence"] < args.min_confidence:
+					payload = {"valid": False}
+				if args.robot:
+					emit_payload(build_robot_command(payload))
+				elif args.emit_json:
 					emit_payload(payload)
 				else:
 					print(
@@ -937,6 +974,8 @@ def run_on_stream(capture, args):
 						)
 					)
 				display = outcome["visualization"]
+				if display is None:
+					display = frame
 
 			if output_path is not None:
 				if writer is None:
@@ -1065,6 +1104,17 @@ def parse_args():
 		help="不開啟即時顯示視窗，適合無頭環境",
 	)
 	parser.add_argument(
+		"--robot",
+		action="store_true",
+		help="機器運行模式：只輸出角度與橫向誤差，跳過繪圖與顯示",
+	)
+	parser.add_argument(
+		"--min-confidence",
+		type=float,
+		default=None,
+		help="低於此可信度視同沒有偵測到；機器運行模式預設 0.5，其餘預設不過濾",
+	)
+	parser.add_argument(
 		"--emit-json",
 		action="store_true",
 		help="以 JSON Lines 輸出控制量給機器人中心電腦，取代人類可讀的輸出",
@@ -1125,6 +1175,15 @@ def main():
 	# 讀取參數，依序完成 mask 清理、目標選取、方向分析與結果輸出。
 	args = parse_args()
 
+	if args.min_confidence is None:
+		# 機器運行模式的錯誤會直接變成錯誤的動作，預設就要過濾；
+		# 其他模式維持原本不過濾的行為，以免影響既有用法。
+		args.min_confidence = 0.5 if args.robot else 0.0
+	if args.robot:
+		# 機器上沒有螢幕，也不需要錄影。
+		args.no_display = True
+		args.no_save = True
+
 	if args.realsense:
 		width, height = args.realsense_size
 		capture = RealSenseCapture(
@@ -1167,11 +1226,14 @@ def main():
 	angle_filter = AxisAngleFilter(alpha=0.25)
 	result = apply_angle_filter(result, angle_filter)
 
-	visualization, errors = make_visualization(
+	errors = calculate_control_errors(
+		result, mask.shape[1], args.robot_angle
+	)
+	visualization = make_visualization(
 		cleaned_mask,
 		component["mask"],
 		result,
-		args.robot_angle,
+		errors,
 	)
 
 	save_outputs(

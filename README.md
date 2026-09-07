@@ -172,6 +172,8 @@ python straw.py --camera --no-display --emit-json | python robot_control.py
 | `--output` | `output/straw_detection.png` | 標註輸出路徑；影片/相機模式未指定時自動改為 `.mp4` |
 | `--no-display` | 關 | 不開預覽視窗（僅影片/相機模式） |
 | `--no-save` | 關 | 不儲存輸出（僅影片/相機模式） |
+| `--robot` | 關 | 機器運行模式：只輸出角度與橫向誤差，跳過繪圖與顯示 |
+| `--min-confidence` | 機器模式 0.5，其餘不過濾 | 低於此可信度視同沒有偵測到 |
 | `--emit-json` | 關 | 以 JSON Lines 輸出控制量，取代人類可讀輸出 |
 | `--save-masks` | 關 | 額外輸出目標 mask 與完整 HSV mask（僅圖片模式） |
 | `--min-area` | 5000 | 有效連通區的最小像素面積 |
@@ -214,6 +216,37 @@ ros2 topic echo /straw/target
 
 訊息內容與 `--emit-json` 相同，另外多了 `stamp_sec` / `stamp_nanosec`
 （取自來源影像的 header，供控制端對時）。
+
+### 機器運行模式
+
+`--robot` 是給實際跑在機器人上的模式：只輸出控制迴圈會用到的量，
+跳過繪圖與顯示，並自動套用可信度門檻。
+
+```bash
+python straw.py --realsense --robot | python robot_control.py
+```
+
+```json
+{"valid": true, "heading_error_deg": 1.26, "lateral_error_m": -0.01, "lateral_error_ratio": -0.0093}
+```
+
+**欄位固定不變**，控制端不必判斷欄位在不在。`valid` 為 `false` 時其餘
+三個欄位都是 `null` —— 沒有偵測到目標時應維持前一個指令或停止。
+沒有深度來源時 `lateral_error_m` 為 `null`，改用 `lateral_error_ratio`。
+
+與其他模式的差別：
+
+| | 一般 | `--emit-json` | `--robot` |
+|---|---|---|---|
+| 輸出 | 人類可讀 | 完整 JSON | 僅角度與橫向誤差 |
+| 繪圖 | 有 | 有 | **無** |
+| 顯示視窗 / 存檔 | 有 | 有 | **強制關閉** |
+| 可信度過濾 | 無 | 無 | **預設 0.5** |
+| 速度（1920x1080） | 46.2 ms | 46.2 ms | **34.0 ms** |
+
+跳過繪圖省下約四分之一的時間（21.6 → 29.4 fps）。可信度門檻用
+`--min-confidence` 調整，設 0 可關閉；機器運行模式的錯誤會直接變成
+錯誤的動作，因此預設就會過濾。
 
 ### 深度：把像素換成公尺
 
