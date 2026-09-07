@@ -18,7 +18,6 @@
 
 import json
 
-import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
@@ -28,7 +27,8 @@ from std_msgs.msg import String
 
 from straw import (DEFAULT_LOWER_HSV, DEFAULT_MIN_AREA,
                    DEFAULT_MORPHOLOGY_KERNEL, DEFAULT_ROBOT_ANGLE,
-                   DEFAULT_UPPER_HSV, AxisAngleFilter, process_frame)
+                   DEFAULT_UPPER_HSV, AxisAngleFilter, build_depth_fields,
+                   process_frame)
 
 
 class DetectionSettings:
@@ -209,12 +209,10 @@ class StrawDetectorNode(Node):
 	def measure_depth(self, center_px, depth_message):
 		"""把目標中心像素還原成相機座標系的公尺座標。
 
-		回傳的欄位一律存在，has_depth 說明這次有沒有取到有效深度，
-		控制端不必用「欄位在不在」來判斷。
+		實際換算與 straw.py 共用，避免命令列與 ROS2 兩邊各寫一份。
 		"""
-		missing = {"has_depth": False}
 		if depth_message is None or self.intrinsics is None:
-			return missing
+			return {"has_depth": False}
 
 		try:
 			depth_image = self.bridge.imgmsg_to_cv2(
@@ -222,46 +220,15 @@ class StrawDetectorNode(Node):
 			)
 		except Exception as error:
 			self.get_logger().warn("深度影像轉換失敗: %s" % error)
-			return missing
+			return {"has_depth": False}
 
-		depth_metres = self.sample_depth(depth_image, center_px)
-		if depth_metres is None:
-			return missing
-
-		fx, fy, cx, cy = self.intrinsics
-		# 針孔模型反投影。x 向右、y 向下、z 向前，單位公尺。
-		x = (float(center_px[0]) - cx) * depth_metres / fx
-		y = (float(center_px[1]) - cy) * depth_metres / fy
-		return {
-			"has_depth": True,
-			"distance_m": round(depth_metres, 4),
-			"lateral_error_m": round(x, 4),
-			"position_m": [round(x, 4), round(y, 4), round(depth_metres, 4)],
-		}
-
-	def sample_depth(self, depth_image, center_px):
-		"""取中心鄰域的深度中位數，單位公尺；沒有有效值時回傳 None。
-
-		單一像素的深度常常是 0：反光、物體邊緣、超出量程都會造成破洞。
-		取鄰域並剔除 0 之後再取中位數，比直接讀一個像素穩定得多。
-		"""
-		height, width = depth_image.shape[:2]
-		u = int(round(float(center_px[0])))
-		v = int(round(float(center_px[1])))
-		radius = self.depth_patch_radius
-		left = max(0, u - radius)
-		right = min(width, u + radius + 1)
-		top = max(0, v - radius)
-		bottom = min(height, v + radius + 1)
-		if left >= right or top >= bottom:
-			return None
-
-		patch = depth_image[top:bottom, left:right].astype(np.float32)
-		valid = patch[patch > 0.0]
-		if valid.size == 0:
-			return None
-
-		return float(np.median(valid)) * self.depth_scale
+		return build_depth_fields(
+			center_px,
+			depth_image,
+			self.intrinsics,
+			self.depth_patch_radius,
+			self.depth_scale,
+		)
 
 	def publish_payload(self, payload, source_message):
 		"""發佈一筆結果，時間戳沿用來源影像，供控制端對時。"""

@@ -24,6 +24,9 @@ DEFAULT_BORDER_MARGIN = 2
 # 影像座標中畫面的縱向為 90 度。機器人對準稻草捆長軸時，
 # 目標軸線應與畫面縱向重合，此時角度誤差為 0。
 DEFAULT_ROBOT_ANGLE = 90.0
+# RealSense 深度影像為 16UC1，單位公釐。
+DEFAULT_DEPTH_SCALE = 0.001
+DEFAULT_DEPTH_PATCH_RADIUS = 6
 # 可信度三項證據的模糊區間端點，依實測值設定（見 calculate_confidence）。
 DEFAULT_STRAIGHT_FLOOR = 0.5
 DEFAULT_STRAIGHT_TARGET = 0.85
@@ -566,6 +569,69 @@ def calculate_heading_error(target_angle, robot_angle=DEFAULT_ROBOT_ANGLE):
 	return (target_angle - robot_angle + 90.0) % 180.0 - 90.0
 
 
+def sample_depth_patch(
+	depth_image,
+	center_px,
+	radius=DEFAULT_DEPTH_PATCH_RADIUS,
+	depth_scale=DEFAULT_DEPTH_SCALE,
+):
+	"""取中心鄰域的深度中位數，單位公尺；沒有有效值時回傳 None。
+
+	單一像素的深度常常是 0：反光、物體邊緣、超出量程都會造成破洞。
+	取鄰域並剔除 0 之後再取中位數，比直接讀一個像素穩定得多。
+	"""
+	height, width = depth_image.shape[:2]
+	column = int(round(float(center_px[0])))
+	row = int(round(float(center_px[1])))
+	left = max(0, column - radius)
+	right = min(width, column + radius + 1)
+	top = max(0, row - radius)
+	bottom = min(height, row + radius + 1)
+	if left >= right or top >= bottom:
+		return None
+
+	patch = depth_image[top:bottom, left:right].astype(np.float32)
+	valid = patch[patch > 0.0]
+	if valid.size == 0:
+		return None
+
+	return float(np.median(valid)) * depth_scale
+
+
+def build_depth_fields(
+	center_px,
+	depth_image,
+	intrinsics,
+	radius=DEFAULT_DEPTH_PATCH_RADIUS,
+	depth_scale=DEFAULT_DEPTH_SCALE,
+):
+	"""把目標中心像素還原成相機座標系的公尺座標。
+
+	intrinsics 為 (fx, fy, cx, cy)。回傳的欄位一律存在，has_depth 說明
+	這次有沒有取到有效深度，控制端不必用「欄位在不在」來判斷。
+	"""
+	missing = {"has_depth": False}
+	if depth_image is None or intrinsics is None:
+		return missing
+
+	depth_metres = sample_depth_patch(
+		depth_image, center_px, radius, depth_scale
+	)
+	if depth_metres is None:
+		return missing
+
+	fx, fy, cx, cy = intrinsics
+	# 針孔模型反投影。x 向右、y 向下、z 向前，單位公尺。
+	x = (float(center_px[0]) - cx) * depth_metres / fx
+	y = (float(center_px[1]) - cy) * depth_metres / fy
+	return {
+		"has_depth": True,
+		"distance_m": round(depth_metres, 4),
+		"lateral_error_m": round(x, 4),
+		"position_m": [round(x, 4), round(y, 4), round(depth_metres, 4)],
+	}
+
+
 def calculate_control_errors(result, image_width, robot_angle=DEFAULT_ROBOT_ANGLE):
 	"""計算要回傳給機器人的兩個控制量。
 
@@ -746,6 +812,90 @@ def emit_payload(payload):
 	print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+class RealSenseCapture:
+	"""把 pyrealsense2 的串流包成 cv2.VideoCapture 的介面。
+
+	OpenCV 的 UVC 路徑抓不到 RealSense 的彩色串流：裝置會註冊多個 UVC
+	節點，MSMF 能開啟卻取不到影格（錯誤 0xC00D3704）。改用官方 SDK 才
+	可靠，順帶也拿得到深度與內參。
+
+	介面刻意與 VideoCapture 相同，run_on_stream 因此不必區分輸入來源。
+	"""
+
+	def __init__(self, width, height, fps, use_depth=True, timeout_ms=10000):
+		import pyrealsense2 as rs
+
+		self.rs = rs
+		self.fps = fps
+		self.use_depth = use_depth
+		self.timeout_ms = timeout_ms
+		self.depth_image = None
+		self.intrinsics = None
+
+		self.pipeline = rs.pipeline()
+		config = rs.config()
+		config.enable_stream(
+			rs.stream.color, width, height, rs.format.bgr8, fps
+		)
+		if use_depth:
+			config.enable_stream(
+				rs.stream.depth, width, height, rs.format.z16, fps
+			)
+		self.profile = self.pipeline.start(config)
+		# 深度對齊到彩色，兩者才會共用同一組內參與同一個像素座標。
+		self.aligner = rs.align(rs.stream.color) if use_depth else None
+
+	def read(self):
+		"""回傳 (是否成功, BGR 影像)，並記下同一格的深度。"""
+		try:
+			frames = self.pipeline.wait_for_frames(self.timeout_ms)
+		except RuntimeError as error:
+			# 最常見的原因是相機仍被別的程式佔用：realsense_test.py 還開著，
+			# 或先前用 OpenCV 開過同一個 UVC 節點而未完全釋放。
+			raise RuntimeError(
+				"RealSense 影格逾時（%s）。請確認相機沒有被其他程式佔用。"
+				% error
+			)
+		if self.aligner is not None:
+			frames = self.aligner.process(frames)
+
+		color_frame = frames.get_color_frame()
+		if not color_frame:
+			return False, None
+
+		if self.intrinsics is None:
+			profile = color_frame.get_profile().as_video_stream_profile()
+			values = profile.get_intrinsics()
+			self.intrinsics = (
+				values.fx, values.fy, values.ppx, values.ppy
+			)
+
+		self.depth_image = None
+		if self.use_depth:
+			depth_frame = frames.get_depth_frame()
+			if depth_frame:
+				self.depth_image = np.asanyarray(depth_frame.get_data())
+
+		return True, np.asanyarray(color_frame.get_data())
+
+	def describe_depth(self, center_px):
+		"""目標中心的公尺座標，供 run_on_stream 併進輸出。"""
+		return build_depth_fields(
+			center_px, self.depth_image, self.intrinsics
+		)
+
+	def get(self, prop):
+		if prop == cv2.CAP_PROP_FPS:
+			return float(self.fps)
+		return 0.0
+
+	def isOpened(self):
+		return True
+
+	def release(self):
+		self.pipeline.stop()
+
+
 def run_on_stream(capture, args):
 	"""逐格讀取影片或相機畫面，即時偵測並可選擇顯示/儲存結果。"""
 	angle_filter = AxisAngleFilter(alpha=0.25)
@@ -767,14 +917,24 @@ def run_on_stream(capture, args):
 					emit_payload({"valid": False})
 			else:
 				result = outcome["result"]
+				payload = outcome["payload"]
+				# RealSense 輸入才有深度，其餘來源沒有這個方法。
+				if hasattr(capture, "describe_depth"):
+					payload = dict(payload)
+					payload.update(capture.describe_depth(result["center"]))
 				if args.emit_json:
-					emit_payload(outcome["payload"])
+					emit_payload(payload)
 				else:
 					print(
 						f"角度誤差: {outcome['errors']['heading_error']:+6.1f} deg  "
 						f"橫向誤差: {outcome['errors']['lateral_error']:+7.1f} px  "
 						f"({outcome['errors']['lateral_error_ratio']:+.2f})  "
 						f"可信度: {result['confidence']:.2f}"
+						+ (
+							f"  距離: {payload['distance_m']:.3f} m"
+							if payload.get("has_depth")
+							else ""
+						)
 					)
 				display = outcome["visualization"]
 
@@ -876,6 +1036,30 @@ def parse_args():
 		help="相機裝置編號（預設 0）；提供後以相機作為輸入來源（優先於 --video/--image）",
 	)
 	parser.add_argument(
+		"--realsense",
+		action="store_true",
+		help="以 pyrealsense2 直接讀取 RealSense（OpenCV 的 --camera 抓不到其彩色串流）",
+	)
+	parser.add_argument(
+		"--realsense-size",
+		type=int,
+		nargs=2,
+		metavar=("W", "H"),
+		default=(1280, 720),
+		help="RealSense 串流解析度",
+	)
+	parser.add_argument(
+		"--realsense-fps",
+		type=int,
+		default=30,
+		help="RealSense 串流影格率",
+	)
+	parser.add_argument(
+		"--no-realsense-depth",
+		action="store_true",
+		help="RealSense 模式下不啟用深度串流",
+	)
+	parser.add_argument(
 		"--no-display",
 		action="store_true",
 		help="不開啟即時顯示視窗，適合無頭環境",
@@ -940,6 +1124,16 @@ def parse_args():
 def main():
 	# 讀取參數，依序完成 mask 清理、目標選取、方向分析與結果輸出。
 	args = parse_args()
+
+	if args.realsense:
+		width, height = args.realsense_size
+		capture = RealSenseCapture(
+			width, height, args.realsense_fps, not args.no_realsense_depth
+		)
+		if args.output == DEFAULT_IMAGE_OUTPUT:
+			args.output = DEFAULT_VIDEO_OUTPUT
+		run_on_stream(capture, args)
+		return
 
 	if args.camera is not None or args.video is not None:
 		source = args.video if args.camera is None else args.camera

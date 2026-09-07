@@ -24,12 +24,44 @@ python straw.py --video data/IMG_4215.MOV
 # 相機（--camera 不帶數字代表裝置 0）
 python straw.py --camera
 python straw.py --camera 1
+
+# RealSense（走官方 SDK，不是 OpenCV 的 --camera）
+python straw.py --realsense
 ```
 
 影片與相機模式會開啟即時預覽視窗，按 `q` 或 `Esc` 結束。無頭環境請加 `--no-display`。
 
 > `--image` 的預設值是 `IMG_3231.JPEG`，該檔案不在本專案內，使用圖片模式時請明確指定路徑。
 > `data/*.MOV` 因體積過大不進版控，測試影片請自行放入 `data/`。
+
+### RealSense 要用 `--realsense`，不要用 `--camera`
+
+OpenCV 的 UVC 路徑抓不到 RealSense 的彩色串流。D435 會註冊多個 UVC
+節點，深度/紅外線那幾個 MSMF 能開啟卻取不到影格，典型錯誤是：
+
+```
+videoio(MSMF): can't grab frame. Error: -1072875772
+```
+
+`--realsense` 改用 `pyrealsense2` 官方 SDK，順帶也拿得到深度與內參：
+
+```bash
+python straw.py --realsense --emit-json
+python straw.py --realsense --realsense-size 640 480 --realsense-fps 30
+```
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--realsense` | 關 | 以 pyrealsense2 讀取 RealSense |
+| `--realsense-size` | `1280 720` | 串流解析度 |
+| `--realsense-fps` | `30` | 串流影格率 |
+| `--no-realsense-depth` | 關 | 不啟用深度串流 |
+
+啟用深度時會把深度對齊到彩色，輸出多出 `has_depth`、`distance_m`、
+`lateral_error_m`、`position_m`（欄位意義見 ROS2 節點那一節）。
+
+相機同時只能被一個程式佔用。若出現「影格逾時」，先確認
+`realsense_test.py` 或其他程式沒有還開著。
 
 ## 處理流程
 
