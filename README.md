@@ -173,6 +173,7 @@ python straw.py --camera --no-display --emit-json | python robot_control.py
 | `--no-display` | 關 | 不開預覽視窗（僅影片/相機模式） |
 | `--no-save` | 關 | 不儲存輸出（僅影片/相機模式） |
 | `--robot` | 關 | 機器運行模式：只輸出角度與橫向誤差，跳過繪圖與顯示 |
+| `--no-frame-drop` | 關 | 相機來源不丟格，逐格處理（延遲會累積，僅供除錯） |
 | `--min-confidence` | 機器模式 0.5，其餘不過濾 | 低於此可信度視同沒有偵測到 |
 | `--emit-json` | 關 | 以 JSON Lines 輸出控制量，取代人類可讀輸出 |
 | `--save-masks` | 關 | 額外輸出目標 mask 與完整 HSV mask（僅圖片模式） |
@@ -216,6 +217,19 @@ ros2 topic echo /straw/target
 
 訊息內容與 `--emit-json` 相同，另外多了 `stamp_sec` / `stamp_nanosec`
 （取自來源影像的 header，供控制端對時）。
+
+### 影格新鮮度
+
+`--camera` 走 OpenCV 的 `VideoCapture`，驅動會累積影格佇列：實測處理
+耗時 100 ms 時 `read()` 只花 0.2 ms 就回傳，代表拿到的是過期影格，
+而且延遲會隨時間累積。因此相機來源預設以背景執行緒讀取，永遠處理
+最新的一格，舊格直接丟棄（`--no-frame-drop` 可關閉）。
+
+**`--realsense` 不套用這個機制。** RealSense 的 pipeline 本身就只保留
+最新的 frameset，實測加不加背景執行緒的端到端延遲相同（中位 56 vs
+55 ms，量測基準為 SDK 的 `time_of_arrival`），多包一層只是增加複雜度。
+
+影片檔一律不丟格 —— 丟格等於跳過內容。
 
 ### 機器運行模式
 
