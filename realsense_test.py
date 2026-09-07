@@ -1,37 +1,216 @@
-import pyrealsense2 as rs
+"""RealSense 串流測試：確認硬體正常，並量出實際的影格率與掉格數。
+
+畫面會卡的原因通常不在這支程式的處理速度（上色 + 併圖只要 1~2 ms），
+而在相機端根本沒把影格送上來。實際量到的元凶是 USB 只跑在 2.x：D435
+的 640x480@30 彩色與深度各約 18 MB/s，兩條加起來超過 USB 2.0 的實用
+頻寬，結果不是變慢而是一格都收不到 —— pipeline.start() 會成功，
+wait_for_frames() 永遠逾時，嚴重時裝置直接從匯流排上掉線
+（HRESULT 0x8007001F）。換到 USB 3.2 之後同一組設定實測穩定 30.0 fps。
+
+反過來，有兩件事量過但沒有影響，別再往那邊找：sensor 的
+frames_queue_size（rs.pipeline 本身只保留最新的 frameset，改成 1 對
+延遲與掉格都沒有差別），以及各種後處理濾波。
+
+RGB 的 auto_exposure_priority 預設開啟，光線一暗驅動會自己把彩色降到
+6~15 fps 來換曝光時間，看起來也像卡頓，這裡關掉；此次未在暗處實測。
+"""
+
+import argparse
+import time
+
 import numpy as np
 import cv2
+import pyrealsense2 as rs
 
-# 建立 pipeline(影像串流管線)與 config
-pipeline = rs.pipeline()
-config = rs.config()
+# 依頻寬由高到低排列。USB 2.x 撐不住第一組，往下退到能實際出格的組合。
+# 格式為 (說明, 彩色 (寬, 高, fps), 深度 (寬, 高, fps) 或 None)。
+STREAM_CANDIDATES = [
+    ("640x480@30 彩色+深度", (640, 480, 30), (640, 480, 30)),
+    ("640x480@15 彩色+深度", (640, 480, 15), (640, 480, 15)),
+    ("424x240@30 彩色 + 480x270@30 深度", (424, 240, 30), (480, 270, 30)),
+    ("640x480@30 僅彩色", (640, 480, 30), None),
+]
 
-# 設定串流:深度與彩色影像
-config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 
-# 開始串流
-pipeline.start(config)
+def describe_device():
+    """回報連線型態；USB 2.x 是畫面卡頓最常見的根因。"""
+    try:
+        devices = list(rs.context().query_devices())
+    except RuntimeError as error:
+        return None, "無法列舉裝置(%s)。請重新插拔相機。" % error
+    if not devices:
+        return None, "找不到 RealSense 裝置。"
 
-try:
-    while True:
-        frames = pipeline.wait_for_frames()
-        depth_frame = frames.get_depth_frame()
-        color_frame = frames.get_color_frame()
-        if not depth_frame or not color_frame:
-            continue
-
-        depth_image = np.asanyarray(depth_frame.get_data())
-        color_image = np.asanyarray(color_frame.get_data())
-
-        # 深度值套用色彩對照方便觀察(單位為毫米,需先做 alpha 縮放)
-        depth_colormap = cv2.applyColorMap(
-            cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET
+    usb = devices[0].get_info(rs.camera_info.usb_type_descriptor)
+    name = devices[0].get_info(rs.camera_info.name)
+    if usb.startswith("2"):
+        return usb, (
+            "%s 目前是 USB %s 連線。此頻寬吃不下 640x480@30 的彩色+深度，"
+            "會掉格甚至讓裝置掉線；請改插主機板上的 USB 3 埠(藍色/SS)，"
+            "並確認用的是相機原廠的 USB 3 線、中間沒有接 USB 2 集線器。"
+            % (name, usb)
         )
+    return usb, "%s 以 USB %s 連線。" % (name, usb)
 
-        images = np.hstack((color_image, depth_colormap))
-        cv2.imshow('RealSense D435', images)
-        if cv2.waitKey(1) == 27:  # ESC 離開
-            break
-finally:
-    pipeline.stop()
+
+def colorize_depth(depth_image, near_mm, far_mm):
+    """把深度攤在實際工作距離上，無資料塗黑。
+
+    常見的 alpha=0.03 等於把 0~8.5m 攤在整條色階上，但實測場景的深度
+    99.9% 落在 3.5m 內，七成的顏色預算浪費在根本量不到的距離上，近處
+    全擠在藍色端而分不出層次。改成只攤工作距離，對比才夠。
+
+    另外 0 代表立體匹配失敗(沒資料)，不是「很近」。JET 會把它畫成深藍，
+    跟真的很近的像素混在一起；塗黑之後破洞與近處一眼就分得開。
+    """
+    span = max(far_mm - near_mm, 1)
+    scaled = (depth_image.astype(np.float32) - near_mm) * (255.0 / span)
+    colored = cv2.applyColorMap(
+        np.clip(scaled, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
+    )
+    colored[depth_image == 0] = 0
+    return colored
+
+
+def tune_sensors(profile, keep_fps):
+    """不讓驅動為了曝光而偷偷降影格率。"""
+    for sensor in profile.get_device().sensors:
+        if keep_fps and sensor.supports(rs.option.auto_exposure_priority):
+            # 關掉之後驅動就不會為了拉長曝光而偷偷降低影格率。
+            sensor.set_option(rs.option.auto_exposure_priority, 0)
+
+
+def start_stream(color, depth, keep_fps, probe_ms=2000):
+    """啟動串流，並確認真的收得到影格。
+
+    在 USB 2.x 上 pipeline.start() 會成功、wait_for_frames() 卻永遠等不到
+    東西，所以「能不能開起來」不算數，要實際拿到一格才算數。
+    """
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, color[0], color[1],
+                         rs.format.bgr8, color[2])
+    if depth:
+        config.enable_stream(rs.stream.depth, depth[0], depth[1],
+                             rs.format.z16, depth[2])
+
+    profile = pipeline.start(config)
+    tune_sensors(profile, keep_fps)
+    try:
+        pipeline.wait_for_frames(probe_ms)
+    except RuntimeError:
+        pipeline.stop()
+        raise
+    return pipeline
+
+
+def open_camera(args):
+    """依序嘗試候選組合，回傳第一個真的出得了格的串流。"""
+    candidates = STREAM_CANDIDATES
+    if args.no_depth:
+        candidates = [(label, color, None) for label, color, _ in candidates]
+
+    for label, color, depth in candidates:
+        try:
+            pipeline = start_stream(
+                color, depth, not args.keep_auto_exposure_priority)
+        except RuntimeError as error:
+            print("  %s：不可用(%s)" % (label, error))
+            continue
+        print("  %s：可用" % label)
+        return pipeline, label
+    raise RuntimeError(
+        "所有組合都拿不到影格。請重新插拔相機，並確認沒有其他程式"
+        "(straw.py 或另一個 realsense_test.py)正佔用它。"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="RealSense 串流測試")
+    parser.add_argument("--no-depth", action="store_true",
+                        help="只看彩色，頻寬減半")
+    parser.add_argument("--keep-auto-exposure-priority", action="store_true",
+                        help="保留自動曝光優先，暗處畫質較好但影格率會掉")
+    parser.add_argument("--depth-range", type=float, nargs=2,
+                        metavar=("NEAR", "FAR"), default=(0.2, 2.0),
+                        help="深度上色的工作距離，單位公尺，預設 0.2 2.0")
+    parser.add_argument("--no-temporal-filter", action="store_true",
+                        help="關掉時間濾波，可以看到未經平滑的原始雜點")
+    args = parser.parse_args()
+
+    near_mm, far_mm = (round(v * 1000.0) for v in args.depth_range)
+
+    usb, message = describe_device()
+    print(message)
+    if usb is None:
+        return
+
+    print("尋找可用的串流組合：")
+    pipeline, label = open_camera(args)
+    print("使用 %s，ESC 離開。" % label)
+    print("深度上色範圍 %d~%dmm，黑色代表沒有深度資料。" % (near_mm, far_mm))
+
+    # 時間濾波拿前幾格做加權，實測可以把破洞從 22.4% 降到 21.0%、有效值的
+    # 逐格抖動壓掉約 1.6mm。它擋不掉邊緣的假距離(紅點)：預設 delta 是 20mm，
+    # 假值跟歷史值差好幾公尺，會被當成真實變化而放行。spatial 與 median 也
+    # 一樣擋不住 —— 那些假值是 3~6px 的連通小塊，濾波器分不出真假。
+    temporal = None if args.no_temporal_filter else rs.temporal_filter()
+
+    # 顯示最近一秒的實測值，卡頓與否用數字判斷，不靠感覺。
+    #
+    # 這裡看掉格而不是延遲：影格編號的斷號是掉格的直接證據，實測消費端
+    # 放慢到 100ms/格時會從 0 跳到 78。而 now - frame.get_timestamp() 就算
+    # 在那麼卡的情況下也只有 8ms（時間戳的 domain 是 system_time，記的是
+    # 抵達主機的時刻，不含感光到傳輸的那一段），拿來當延遲指標會騙人。
+    shown = 0
+    window_start = time.perf_counter()
+    fps = 0.0
+    dropped = 0
+    previous_number = None
+
+    try:
+        while True:
+            frames = pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                continue
+
+            number = color_frame.get_frame_number()
+            if previous_number is not None:
+                dropped += number - previous_number - 1
+            previous_number = number
+            images = np.asanyarray(color_frame.get_data())
+
+            depth_frame = frames.get_depth_frame()
+            if depth_frame:
+                if temporal is not None:
+                    depth_frame = temporal.process(depth_frame).as_depth_frame()
+                depth_image = np.asanyarray(depth_frame.get_data())
+                depth_colormap = colorize_depth(depth_image, near_mm, far_mm)
+                if depth_colormap.shape[:2] != images.shape[:2]:
+                    depth_colormap = cv2.resize(
+                        depth_colormap, (images.shape[1], images.shape[0])
+                    )
+                images = np.hstack((images, depth_colormap))
+
+            shown += 1
+            elapsed = time.perf_counter() - window_start
+            if elapsed >= 1.0:
+                fps = shown / elapsed
+                shown = 0
+                window_start = time.perf_counter()
+
+            cv2.putText(
+                images, "%.1f fps  dropped %d  USB %s" % (fps, dropped, usb),
+                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
+            )
+            cv2.imshow('RealSense D435', images)
+            if cv2.waitKey(1) == 27:  # ESC 離開
+                break
+    finally:
+        pipeline.stop()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
