@@ -1,6 +1,7 @@
-"""從二值化 mask 偵測最大的稻草捆區域。
+"""偵測稻草捆，輸出機器人對準所需的角度誤差與橫向誤差。
 
-此版本先用離線 mask 驗證幾何分析，偵測邏輯不依賴相機或機器人控制器。
+支援圖片、影片、一般相機與 RealSense 四種輸入；以 --robot 或
+--emit-json 輸出 JSON Lines 給控制端。詳見 README.md。
 """
 
 import argparse
