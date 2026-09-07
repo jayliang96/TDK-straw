@@ -3,5 +3,6 @@ __pycache__/
 # 偵測結果由程式產生，不進版控
 output/
 
-# 測試影片過大（約 24MB），請自行放到 data/
+# 測試影片過大（十幾 MB 到數十 MB），請自行放到 data/
 data/*.MOV
+data/*.mp4

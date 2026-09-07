@@ -148,6 +148,78 @@ python straw.py --camera --no-display --emit-json | python robot_control.py
 | `--upper-hsv` | 33 255 255 | HSV 上界 |
 | `--robot-angle` | 90.0 | 機器人前進方向在影像座標中的角度 |
 
+## ROS2 節點
+
+`straw_ros2_node.py` 訂閱 RealSense 的彩色與深度話題，發佈對準誤差。
+偵測邏輯直接沿用 `straw.py`，本檔只負責 ROS2 的收發與深度換算。
+
+```bash
+# 相依：rclpy、cv_bridge（ROS2 桌面版已包含）
+python straw_ros2_node.py --ros-args \
+    -p image_topic:=/camera/camera/color/image_raw \
+    -p use_depth:=true \
+    -p min_confidence:=0.5
+
+# 看輸出
+ros2 topic echo /straw/target
+```
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `image_topic` | `/camera/camera/color/image_raw` | 來源影像話題 |
+| `depth_topic` | `/camera/camera/aligned_depth_to_color/image_raw` | 對齊後的深度話題 |
+| `camera_info_topic` | `/camera/camera/color/camera_info` | 相機內參來源 |
+| `use_depth` | `true` | 是否訂閱深度並換算公尺座標 |
+| `depth_scale` | `0.001` | 深度單位換算（RealSense 為公釐） |
+| `depth_patch_radius` | `6` | 深度取樣的鄰域半徑（像素） |
+| `sync_slop` | `0.05` | 彩色與深度的時間同步容許誤差（秒） |
+| `target_topic` | `straw/target` | 發佈的結果話題（`std_msgs/String` 承載 JSON） |
+| `annotated_topic` | `straw/annotated` | 標註影像話題，供 rviz 除錯 |
+| `publish_annotated` | `false` | 是否發佈標註影像 |
+| `min_confidence` | `0.5` | 低於此值視同沒有偵測到 |
+| `filter_alpha` | `0.25` | 跨影格軸線平滑係數 |
+| `lower_hsv` / `upper_hsv` / `kernel_size` / `min_area` / `robot_angle` | 同命令列 | 偵測參數 |
+
+訊息內容與 `--emit-json` 相同，另外多了 `stamp_sec` / `stamp_nanosec`
+（取自來源影像的 header，供控制端對時）。
+
+### 深度：把像素換成公尺
+
+`use_depth` 開啟後（預設開啟），節點會同步訂閱對齊後的深度影像，
+把目標中心反投影成相機座標系的公尺座標，訊息多出這幾個欄位：
+
+| 欄位 | 意義 |
+|---|---|
+| `has_depth` | 這次有沒有取到有效深度；為 `false` 時下面三個欄位不存在 |
+| `distance_m` | 目標中心到相機的距離（公尺） |
+| `lateral_error_m` | 目標中心相對相機光軸的水平位移（公尺），正值為右 |
+| `position_m` | `[x, y, z]`，x 向右、y 向下、z 向前，單位公尺 |
+
+有了 `lateral_error_m`，控制端就不必處理「同樣的像素偏移在不同距離
+代表不同實際偏移」這件事，也不需要自己做相機標定。
+
+兩個實作細節：
+
+- **彩色與深度做時間同步**（`ApproximateTimeSynchronizer`，容許誤差
+  `sync_slop`）。兩個串流的時間戳不會完全相同，不同步的話會拿這一格的
+  目標中心去查上一格的深度。
+- **深度取鄰域中位數而非單一像素**（半徑 `depth_patch_radius`）。反光、
+  物體邊緣、超出量程都會讓單一像素的深度變成 0，取鄰域並剔除 0 之後
+  再取中位數穩定得多。整塊都無效時回傳 `has_depth: false`。
+
+深度不可用時（尚未收到 `camera_info`、深度全為 0、轉換失敗）只會讓
+`has_depth` 為 `false`，角度與像素誤差仍照常輸出。
+
+### 兩個容易踩的坑
+
+**QoS 必須用 sensor data。** RealSense 以 `SensorDataQoS`（best effort）
+發佈影像；訂閱端若用 rclpy 預設的 reliable QoS，兩邊不相容，會一則訊息
+都收不到，而且不會報錯。本節點已使用 `qos_profile_sensor_data`。
+
+**話題名稱依 realsense-ros 版本而異。** 較新版本是
+`/camera/camera/color/image_raw`（兩層 camera 命名空間），舊版是
+`/camera/color/image_raw`。先用 `ros2 topic list` 確認，再用參數覆寫。
+
 ## 效能
 
 1920x1080 影片、`IMG_4215.MOV` 60 格實測（CPU，無 GPU）：
@@ -178,5 +250,6 @@ RANSAC 的取樣迴圈已改為矩陣運算一次算完所有候選，`analyze_t
 ## 檔案
 
 - `straw.py` — 全部偵測邏輯與命令列介面
+- `straw_ros2_node.py` — ROS2 節點，訂閱 RealSense 影像並發佈對準誤差
 - `data/` — 測試素材（`.MOV` 不進版控）
 - `output/` — 程式產生的標註結果，不進版控
