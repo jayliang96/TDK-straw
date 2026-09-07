@@ -4,6 +4,7 @@
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import cv2
@@ -563,6 +564,52 @@ def calculate_heading_error(target_angle, robot_angle=DEFAULT_ROBOT_ANGLE):
 	return (target_angle - robot_angle + 90.0) % 180.0 - 90.0
 
 
+def calculate_control_errors(result, image_width, robot_angle=DEFAULT_ROBOT_ANGLE):
+	"""計算要回傳給機器人的兩個控制量。
+
+	角度誤差：目標長軸與機器人前進方向的夾角，0 代表已對正。
+	正值代表目標頂端偏向畫面右側。
+
+	橫向誤差：目標中心相對畫面中線的水平位移，0 代表已對中。
+	正值代表目標位於中線右側。相機裝在機器人中線上，畫面中線即機器人中線。
+
+	橫向誤差同時提供像素值與正規化值。正規化值以半個畫面寬為單位，
+	範圍約 [-1, 1]，不受解析度影響，控制端不必知道相機規格即可使用。
+	像素值要換算成實際距離則需要相機標定與目標距離，本程式不提供。
+	"""
+	heading_error = calculate_heading_error(result["angle"], robot_angle)
+	half_width = image_width / 2.0
+	lateral_error = float(result["center"][0]) - half_width
+	return {
+		"heading_error": float(heading_error),
+		"lateral_error": lateral_error,
+		"lateral_error_ratio": lateral_error / half_width,
+	}
+
+
+def build_robot_payload(result, errors, image_shape):
+	"""組成傳給機器人中心電腦的一筆資料。
+
+	valid 為 False 時代表本影格沒有可用的偵測，控制端應維持前一個指令
+	或停止，不可把缺值當成 0 誤差。
+	"""
+	height, width = image_shape[:2]
+	return {
+		"valid": True,
+		"heading_error_deg": round(errors["heading_error"], 2),
+		"lateral_error_px": round(errors["lateral_error"], 1),
+		"lateral_error_ratio": round(errors["lateral_error_ratio"], 4),
+		"angle_deg": round(float(result["angle"]), 2),
+		"center_px": [
+			round(float(result["center"][0]), 1),
+			round(float(result["center"][1]), 1),
+		],
+		"confidence": round(float(result["confidence"]), 3),
+		"angle_sigma_deg": round(float(result["angle_sigma"]), 3),
+		"image_size": [int(width), int(height)],
+	}
+
+
 def make_visualization(
 	mask, target_mask, result, robot_angle=DEFAULT_ROBOT_ANGLE
 ):
@@ -613,14 +660,36 @@ def make_visualization(
 			tipLength=0.35,
 		)
 
-	heading_error = calculate_heading_error(result["angle"], robot_angle)
+	errors = calculate_control_errors(
+		result, visualization.shape[1], robot_angle
+	)
+
+	# 綠色垂直線是機器人中線，橫線標出目標中心離中線多遠。
+	middle_x = visualization.shape[1] // 2
+	cv2.line(
+		visualization,
+		(middle_x, 0),
+		(middle_x, visualization.shape[0]),
+		(0, 255, 0),
+		2,
+	)
+	cv2.line(
+		visualization,
+		(middle_x, center[1]),
+		(center[0], center[1]),
+		(0, 255, 0),
+		4,
+	)
+
 	text_lines = [
 		f"兩側邊向量和: {result['angle']:.1f} deg",
 		f"左/右側邊: {side_edges['left_angle']:.1f} / "
 		f"{side_edges['right_angle']:.1f} deg",
 		f"左右角度差: {side_edges['side_angle_difference']:.1f} deg",
 		f"PCA 初始參考: {result['pca_angle']:.1f} deg",
-		f"機器人角度誤差: {heading_error:.1f} deg",
+		f"機器人角度誤差: {errors['heading_error']:.1f} deg",
+		f"橫向誤差: {errors['lateral_error']:.0f} px "
+		f"({errors['lateral_error_ratio']:+.2f})",
 		f"方向可信度: {result['confidence']:.2f}",
 	]
 	for index, text in enumerate(text_lines):
@@ -635,7 +704,7 @@ def make_visualization(
 			cv2.LINE_AA,
 		)
 
-	return visualization, heading_error
+	return visualization, errors
 
 
 def process_frame(frame_bgr, args, angle_filter):
@@ -654,15 +723,25 @@ def process_frame(frame_bgr, args, angle_filter):
 		return None
 
 	result = apply_angle_filter(result, angle_filter)
-	visualization, heading_error = make_visualization(
+	visualization, errors = make_visualization(
 		cleaned_mask, component["mask"], result, args.robot_angle
 	)
 	return {
 		"visualization": visualization,
 		"result": result,
-		"heading_error": heading_error,
+		"errors": errors,
+		"payload": build_robot_payload(result, errors, frame_bgr.shape),
 		"component": component,
 	}
+
+
+def emit_payload(payload):
+	"""輸出一筆 JSON 給機器人中心電腦。
+
+	一行一筆（JSON Lines），並立即 flush：控制端多半是逐行讀取，
+	留在緩衝區裡的資料對即時控制沒有意義。
+	"""
+	print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def run_on_stream(capture, args):
@@ -681,14 +760,20 @@ def run_on_stream(capture, args):
 			outcome = process_frame(frame, args, angle_filter)
 			if outcome is None:
 				display = frame
+				if args.emit_json:
+					# 明確送出無效值，控制端才能區分「沒偵測到」與「誤差為 0」。
+					emit_payload({"valid": False})
 			else:
 				result = outcome["result"]
-				print(
-					f"目標中心: ({result['center'][0]:.1f}, {result['center'][1]:.1f})  "
-					f"角度: {result['angle']:.1f} deg  "
-					f"誤差: {outcome['heading_error']:.1f} deg  "
-					f"可信度: {result['confidence']:.2f}"
-				)
+				if args.emit_json:
+					emit_payload(outcome["payload"])
+				else:
+					print(
+						f"角度誤差: {outcome['errors']['heading_error']:+6.1f} deg  "
+						f"橫向誤差: {outcome['errors']['lateral_error']:+7.1f} px  "
+						f"({outcome['errors']['lateral_error_ratio']:+.2f})  "
+						f"可信度: {result['confidence']:.2f}"
+					)
 				display = outcome["visualization"]
 
 			if output_path is not None:
@@ -794,6 +879,11 @@ def parse_args():
 		help="不開啟即時顯示視窗，適合無頭環境",
 	)
 	parser.add_argument(
+		"--emit-json",
+		action="store_true",
+		help="以 JSON Lines 輸出控制量給機器人中心電腦，取代人類可讀的輸出",
+	)
+	parser.add_argument(
 		"--save-masks",
 		action="store_true",
 		help="額外儲存目標 mask 與完整 HSV mask，供離線除錯使用",
@@ -881,7 +971,7 @@ def main():
 	angle_filter = AxisAngleFilter(alpha=0.25)
 	result = apply_angle_filter(result, angle_filter)
 
-	visualization, heading_error = make_visualization(
+	visualization, errors = make_visualization(
 		cleaned_mask,
 		component["mask"],
 		result,
@@ -897,11 +987,19 @@ def main():
 		args.mask is None,
 	)
 
+	if args.emit_json:
+		emit_payload(build_robot_payload(result, errors, mask.shape))
+		return
+
 	print(f"目標面積: {component['area']} px")
 	print(f"目標中心: ({result['center'][0]:.1f}, {result['center'][1]:.1f})")
 	print(f"兩側邊估計長度: {result['long_side']:.1f} px")
 	print(f"兩側邊向量和角度: {result['angle']:.1f} deg")
-	print(f"機器人角度誤差: {heading_error:.1f} deg")
+	print(f"機器人角度誤差: {errors['heading_error']:+.1f} deg")
+	print(
+		f"橫向誤差: {errors['lateral_error']:+.1f} px "
+		f"({errors['lateral_error_ratio']:+.3f} 半畫面寬)"
+	)
 	print(f"主軸細長比: {result['axis_ratio']:.2f}")
 	print(f"輪廓貼齊畫面邊界比例: {result['border_ratio']:.1%}")
 	print(f"側邊直線段佔比: {result['straight_ratio']:.1%}")
