@@ -25,7 +25,9 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 
-from straw import (DEFAULT_LOWER_HSV, DEFAULT_MIN_AREA,
+from straw import (DEFAULT_DEPTH_PATCH_RADIUS, DEFAULT_DEPTH_SCALE,
+                   DEFAULT_FILTER_ALPHA, DEFAULT_LOWER_HSV,
+                   DEFAULT_MIN_AREA, DEFAULT_MIN_CONFIDENCE,
                    DEFAULT_MORPHOLOGY_KERNEL, DEFAULT_ROBOT_ANGLE,
                    DEFAULT_UPPER_HSV, AxisAngleFilter, build_depth_fields,
                    process_frame)
@@ -62,12 +64,12 @@ class StrawDetectorNode(Node):
 		self.declare_parameter("target_topic", "straw/target")
 		self.declare_parameter("annotated_topic", "straw/annotated")
 		self.declare_parameter("publish_annotated", False)
-		self.declare_parameter("min_confidence", 0.5)
-		self.declare_parameter("filter_alpha", 0.25)
-		# RealSense 的深度影像是 16UC1，單位為公釐。
-		self.declare_parameter("depth_scale", 0.001)
-		# 單一像素的深度常常是 0（反光、邊緣、超出量程），取鄰域中位數。
-		self.declare_parameter("depth_patch_radius", 6)
+		self.declare_parameter("min_confidence", DEFAULT_MIN_CONFIDENCE)
+		self.declare_parameter("filter_alpha", DEFAULT_FILTER_ALPHA)
+		self.declare_parameter("depth_scale", DEFAULT_DEPTH_SCALE)
+		self.declare_parameter(
+			"depth_patch_radius", DEFAULT_DEPTH_PATCH_RADIUS
+		)
 		self.declare_parameter("sync_slop", 0.05)
 		self.declare_parameter("lower_hsv", list(DEFAULT_LOWER_HSV))
 		self.declare_parameter("upper_hsv", list(DEFAULT_UPPER_HSV))

@@ -14,11 +14,9 @@ import cv2
 import numpy as np
 
 
-# 與 c1.py 相同的預設 HSV 範圍。
-# DEFAULT_LOWER_HSV = (21, 65, 67)
-# DEFAULT_UPPER_HSV = (33, 255, 255)
-DEFAULT_LOWER_HSV = (16, 84, 42)     # 原本 (21, 65, 67)
-DEFAULT_UPPER_HSV = (33, 255, 255)   # 原本 (33, 255, 255)
+# 稻草捆的 HSV 色彩範圍，依實際光線調整。
+DEFAULT_LOWER_HSV = (16, 84, 42)
+DEFAULT_UPPER_HSV = (33, 255, 255)
 DEFAULT_MIN_AREA = 5000
 DEFAULT_MORPHOLOGY_KERNEL = 11
 DEFAULT_RANSAC_THRESHOLD = 12.0
@@ -27,6 +25,9 @@ DEFAULT_BORDER_MARGIN = 2
 # 影像座標中畫面的縱向為 90 度。機器人對準稻草捆長軸時，
 # 目標軸線應與畫面縱向重合，此時角度誤差為 0。
 DEFAULT_ROBOT_ANGLE = 90.0
+DEFAULT_FILTER_ALPHA = 0.25
+# 機器運行模式的可信度門檻；錯誤的讀數會直接變成錯誤的動作。
+DEFAULT_MIN_CONFIDENCE = 0.5
 # RealSense 深度影像為 16UC1，單位公釐。
 DEFAULT_DEPTH_SCALE = 0.001
 DEFAULT_DEPTH_PATCH_RADIUS = 6
@@ -47,12 +48,14 @@ def load_image(image_path):
 	return image
 
 
-def create_color_mask(image_bgr, lower_bound, upper_bound, kernel_size=11):
-	"""依照 c1.py 的 HSV 色彩範圍建立稻草捆 mask。"""
+def create_color_mask(
+	image_bgr, lower_bound, upper_bound, kernel_size=DEFAULT_MORPHOLOGY_KERNEL
+):
+	"""以 HSV 色彩範圍建立稻草捆 mask，並做形態學去雜訊。"""
 	image_hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 	mask = cv2.inRange(image_hsv, lower_bound, upper_bound)
 
-	# 與 c1.py 相同：先去除小雜訊，再填補目標區域的小缺口。
+	# 先去除小雜訊，再填補目標區域的小缺口。
 	kernel = cv2.getStructuringElement(
 		cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
 	)
@@ -71,20 +74,7 @@ def load_mask(mask_path):
 	return mask
 
 
-def clean_mask(mask, kernel_size=5):
-	"""移除小雜訊，並填補稻草捆輪廓中的小缺口。"""
-	if kernel_size <= 1:
-		return mask.copy()
-
-	kernel = cv2.getStructuringElement(
-		cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
-	)
-	cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-	cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
-	return cleaned
-
-
-def select_largest_component(mask, min_area=5000):
+def select_largest_component(mask, min_area=DEFAULT_MIN_AREA):
 	"""找出最大的前景連通區，只保留最可能的稻草捆。"""
 	num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
 		mask, connectivity=8
@@ -101,16 +91,9 @@ def select_largest_component(mask, min_area=5000):
 	target_mask = np.zeros_like(mask)
 	target_mask[labels == component_label] = 255
 
-	x = int(stats[component_label, cv2.CC_STAT_LEFT])
-	y = int(stats[component_label, cv2.CC_STAT_TOP])
-	width = int(stats[component_label, cv2.CC_STAT_WIDTH])
-	height = int(stats[component_label, cv2.CC_STAT_HEIGHT])
-
 	return {
 		"mask": target_mask,
 		"area": area,
-		"bbox": (x, y, width, height),
-		"centroid": tuple(centroids[component_label]),
 	}
 
 
@@ -123,7 +106,7 @@ def axis_angle_difference(first_angle, second_angle):
 class AxisAngleFilter:
 	"""針對 180 度週期的物體軸線做連續影格平滑。"""
 
-	def __init__(self, alpha=0.25):
+	def __init__(self, alpha=DEFAULT_FILTER_ALPHA):
 		self.alpha = alpha
 		self.filtered_angle = None
 
@@ -218,9 +201,7 @@ def fit_line_ransac(
 	return {
 		"point": point,
 		"direction": direction,
-		"inliers": points[best_inliers],
 		"inlier_mask": best_inliers,
-		"inlier_ratio": float(np.mean(best_inliers)),
 		"error": best_error,
 	}
 
@@ -267,9 +248,6 @@ def fit_straight_segment(
 	if segment_fit is None:
 		return None
 
-	# inlier_ratio 保留整體擬合的數值，才能反映這個種子方向好不好；
-	# 重新擬合後的內點率幾乎恆為 1，沒有區別力。
-	segment_fit["inlier_ratio"] = initial_fit["inlier_ratio"]
 	segment_fit["segment"] = segment
 	segment_fit["straight_ratio"] = best_length / float(len(points))
 	return segment_fit
@@ -394,8 +372,6 @@ def fit_side_edges(contour_points, border_ratio, seed_direction):
 	)
 
 	return {
-		"left_points": np.asarray(left_points),
-		"right_points": np.asarray(right_points),
 		"left_start": left_start,
 		"left_end": left_end,
 		"right_start": right_start,
@@ -420,8 +396,6 @@ def fit_side_edges(contour_points, border_ratio, seed_direction):
 		"right_sample_count": int(len(right_fit["segment"])),
 		"left_length": float(np.linalg.norm(left_end - left_start)),
 		"right_length": float(np.linalg.norm(right_end - right_start)),
-		"left_inlier_ratio": left_fit["inlier_ratio"],
-		"right_inlier_ratio": right_fit["inlier_ratio"],
 		"angle": summed_angle,
 	}
 
@@ -494,9 +468,7 @@ def analyze_target(target_mask):
 	# 取得整個目標的主要分布方向，作為實際長軸方向。
 	points_yx = np.column_stack(np.where(target_mask > 0))
 	points_xy = points_yx[:, ::-1].astype(np.float32)
-	mean, eigenvectors, eigenvalues = cv2.PCACompute2(
-		points_xy, mean=None
-	)
+	_, eigenvectors, eigenvalues = cv2.PCACompute2(points_xy, mean=None)
 	pca_vector = eigenvectors[0]
 	pca_angle = float(np.degrees(np.arctan2(pca_vector[1], pca_vector[0])))
 
@@ -562,8 +534,6 @@ def analyze_target(target_mask):
 		"seed_margin": float(seed_margin),
 		"direction": direction,
 		"side_edges": side_edges,
-		"eigenvalues": eigenvalues,
-		"mean": mean,
 	}
 
 
@@ -780,10 +750,10 @@ def process_frame(frame_bgr, args, angle_filter, build_visualization=True):
 	"""
 	lower_bound = np.array(args.lower_hsv, dtype=np.uint8)
 	upper_bound = np.array(args.upper_hsv, dtype=np.uint8)
-	mask = create_color_mask(frame_bgr, lower_bound, upper_bound, args.kernel_size)
-	cleaned_mask = clean_mask(mask, 1)
-
-	component = select_largest_component(cleaned_mask, args.min_area)
+	mask = create_color_mask(
+		frame_bgr, lower_bound, upper_bound, args.kernel_size
+	)
+	component = select_largest_component(mask, args.min_area)
 	if component is None:
 		return None
 
@@ -798,14 +768,13 @@ def process_frame(frame_bgr, args, angle_filter, build_visualization=True):
 	visualization = None
 	if build_visualization:
 		visualization = make_visualization(
-			cleaned_mask, component["mask"], result, errors
+			mask, component["mask"], result, errors
 		)
 	return {
 		"visualization": visualization,
 		"result": result,
 		"errors": errors,
 		"payload": build_robot_payload(result, errors, frame_bgr.shape),
-		"component": component,
 	}
 
 
@@ -871,9 +840,37 @@ class RealSenseCapture:
 			config.enable_stream(
 				rs.stream.depth, width, height, rs.format.z16, fps
 			)
-		self.profile = self.pipeline.start(config)
+		try:
+			self.profile = self.pipeline.start(config)
+		except RuntimeError as error:
+			# SDK 只會說 "Couldn't resolve requests"，看不出原因。
+			# 最常見的是相機插在 USB 2.0 埠：D435 在 USB 2.1 模式下
+			# 深度最高只到 640x480，1280x720 無法成立。
+			raise RuntimeError(
+				"無法以 %dx%d@%d 啟動 RealSense（%s）。%s"
+				% (width, height, fps, error, self.describe_device())
+			)
 		# 深度對齊到彩色，兩者才會共用同一組內參與同一個像素座標。
 		self.aligner = rs.align(rs.stream.color) if use_depth else None
+
+	def describe_device(self):
+		"""回報連線型態，USB 2.x 會大幅限制可用的解析度。"""
+		try:
+			devices = list(self.rs.context().query_devices())
+			if not devices:
+				return "找不到 RealSense 裝置。"
+			usb = devices[0].get_info(
+				self.rs.camera_info.usb_type_descriptor
+			)
+		except Exception:
+			return "無法讀取裝置資訊。"
+
+		if usb.startswith("2"):
+			return (
+				"目前為 USB %s 連線，此模式下深度最高只到 640x480；"
+				"請改插 USB 3 埠，或加上 --realsense-size 640 480。" % usb
+			)
+		return "目前為 USB %s 連線，請確認相機沒有被其他程式佔用。" % usb
 
 	def read(self):
 		"""回傳 (是否成功, BGR 影像)，並記下同一格的深度。"""
@@ -1013,7 +1010,7 @@ def wrap_live_capture(capture, args):
 
 def run_on_stream(capture, args):
 	"""逐格讀取影片或相機畫面，即時偵測並可選擇顯示/儲存結果。"""
-	angle_filter = AxisAngleFilter(alpha=0.25)
+	angle_filter = AxisAngleFilter(alpha=DEFAULT_FILTER_ALPHA)
 	writer = None
 	window_name = "TDK Straw Detection"
 	output_path = None if args.no_save or not args.output else Path(args.output)
@@ -1150,7 +1147,7 @@ def parse_args():
 	parser.add_argument(
 		"--image",
 		default="IMG_3231.JPEG",
-		help="原始 BGR 圖片路徑，預設使用 c1.py 的測試圖片",
+		help="原始 BGR 圖片路徑",
 	)
 	parser.add_argument(
 		"--mask",
@@ -1245,7 +1242,7 @@ def parse_args():
 		"--kernel-size",
 		type=int,
 		default=DEFAULT_MORPHOLOGY_KERNEL,
-		help="HSV mask 的形態學核心大小，與 c1.py 預設值一致",
+		help="HSV mask 的形態學核心大小",
 	)
 	parser.add_argument(
 		"--lower-hsv",
@@ -1253,7 +1250,7 @@ def parse_args():
 		nargs=3,
 		default=DEFAULT_LOWER_HSV,
 		metavar=("H", "S", "V"),
-		help="HSV 下界，與 c1.py 預設值一致",
+		help="HSV 下界",
 	)
 	parser.add_argument(
 		"--upper-hsv",
@@ -1261,7 +1258,7 @@ def parse_args():
 		nargs=3,
 		default=DEFAULT_UPPER_HSV,
 		metavar=("H", "S", "V"),
-		help="HSV 上界，與 c1.py 預設值一致",
+		help="HSV 上界",
 	)
 	parser.add_argument(
 		"--robot-angle",
@@ -1279,7 +1276,7 @@ def main():
 	if args.min_confidence is None:
 		# 機器運行模式的錯誤會直接變成錯誤的動作，預設就要過濾；
 		# 其他模式維持原本不過濾的行為，以免影響既有用法。
-		args.min_confidence = 0.5 if args.robot else 0.0
+		args.min_confidence = DEFAULT_MIN_CONFIDENCE if args.robot else 0.0
 	if args.robot:
 		# 機器上沒有螢幕，也不需要錄影。
 		args.no_display = True
@@ -1314,9 +1311,7 @@ def main():
 		return
 
 	mask = build_input_mask(args)
-
-	cleaned_mask = clean_mask(mask, 1)
-	component = select_largest_component(cleaned_mask, args.min_area)
+	component = select_largest_component(mask, args.min_area)
 
 	if component is None:
 		raise RuntimeError(
@@ -1330,14 +1325,14 @@ def main():
 		)
 
 	# 相機連續取像時，應在影像迴圈外建立並重複使用同一個 filter。
-	angle_filter = AxisAngleFilter(alpha=0.25)
+	angle_filter = AxisAngleFilter(alpha=DEFAULT_FILTER_ALPHA)
 	result = apply_angle_filter(result, angle_filter)
 
 	errors = calculate_control_errors(
 		result, mask.shape[1], args.robot_angle
 	)
 	visualization = make_visualization(
-		cleaned_mask,
+		mask,
 		component["mask"],
 		result,
 		errors,

@@ -68,6 +68,8 @@ python straw.py --realsense --realsense-size 640 480 --realsense-fps 30
 
 相機同時只能被一個程式佔用。若出現「影格逾時」，先確認 `realsense_test.py` 或其他程式沒有還開著。
 
+**務必插在 USB 3 埠。** D435 在 USB 2.x 模式下深度最高只到 640x480，預設的 1280x720 會啟動失敗（SDK 只會回報 `Couldn't resolve requests`）。本程式會偵測連線型態並在錯誤訊息中指出，此時改用 `--realsense-size 640 480` 可先跑起來。
+
 ### 影格新鮮度
 
 `--camera` 走 OpenCV 的 `VideoCapture`，驅動會累積影格佇列：實測在每輪處理耗時 100 ms 的情況下 `read()` 只花 **0.2 ms** 就回傳，代表拿到的是過期影格，且延遲會隨時間累積。因此相機來源預設以背景執行緒讀取，永遠處理最新的一格，舊格直接丟棄（`--no-frame-drop` 可關閉）。
