@@ -22,6 +22,9 @@ DEFAULT_MORPHOLOGY_KERNEL = 11
 DEFAULT_RANSAC_THRESHOLD = 12.0
 DEFAULT_RANSAC_ITERATIONS = 300
 DEFAULT_BORDER_MARGIN = 2
+# 左右側邊夾角的上限。真實的兩條側邊接近平行，透視收斂實測不超過 30 度；
+# 超過此值代表兩條線擬在同一段圓弧上，不是物體的兩側。
+DEFAULT_MAX_SIDE_ANGLE_DIFFERENCE = 45.0
 # 影像座標中畫面的縱向為 90 度。機器人對準稻草捆長軸時，
 # 目標軸線應與畫面縱向重合，此時角度誤差為 0。
 DEFAULT_ROBOT_ANGLE = 90.0
@@ -288,7 +291,12 @@ def extract_contour_points(target_mask, border_margin=DEFAULT_BORDER_MARGIN):
 	return contour_points, border_ratio
 
 
-def fit_side_edges(contour_points, border_ratio, seed_direction):
+def fit_side_edges(
+	contour_points,
+	border_ratio,
+	seed_direction,
+	max_side_angle_difference=DEFAULT_MAX_SIDE_ANGLE_DIFFERENCE,
+):
 	"""從輪廓的左右邊界擬合兩條側邊，並將向量相加。
 
 	seed_direction 只用來建立物體的初始縱向座標，最後方向由左右側邊
@@ -365,8 +373,22 @@ def fit_side_edges(contour_points, border_ratio, seed_direction):
 		np.linalg.norm(left_end - left_start)
 		+ np.linalg.norm(right_end - right_start)
 	) / 2.0
-	left_angle = float(np.degrees(np.arctan2(left_direction[1], left_direction[0])))
-	right_angle = float(np.degrees(np.arctan2(right_direction[1], right_direction[0])))
+	left_angle = float(
+		np.degrees(np.arctan2(left_direction[1], left_direction[0]))
+	)
+	right_angle = float(
+		np.degrees(np.arctan2(right_direction[1], right_direction[0]))
+	)
+	side_angle_difference = axis_angle_difference(left_angle, right_angle)
+
+	# 目標只露出一小截時，兩條線可能都擬在同一段端點圓弧上，成為該弧的
+	# 兩條切線 —— 此時夾角會遠大於透視造成的收斂。真實側邊接近平行，
+	# 實測正常情形不超過 30 度，因此夾角過大就判定這個種子方向失敗。
+	# 這是物理合理性的硬性否決，與可信度的漸進評分是兩回事：可信度
+	# 刻意不看夾角，因為在正常範圍內夾角大反而代表擬到了真正的側邊。
+	if side_angle_difference > max_side_angle_difference:
+		return None
+
 	summed_angle = float(
 		np.degrees(np.arctan2(summed_direction[1], summed_direction[0]))
 	)
@@ -383,7 +405,7 @@ def fit_side_edges(contour_points, border_ratio, seed_direction):
 		"direction": summed_direction,
 		"left_angle": left_angle,
 		"right_angle": right_angle,
-		"side_angle_difference": axis_angle_difference(left_angle, right_angle),
+		"side_angle_difference": side_angle_difference,
 		"border_ratio": border_ratio,
 		"straight_ratio": (
 			left_fit["straight_ratio"] + right_fit["straight_ratio"]
