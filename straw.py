@@ -25,6 +25,12 @@ DEFAULT_BORDER_MARGIN = 2
 # 左右側邊夾角的上限。真實的兩條側邊接近平行，透視收斂實測不超過 30 度；
 # 超過此值代表兩條線擬在同一段圓弧上，不是物體的兩側。
 DEFAULT_MAX_SIDE_ANGLE_DIFFERENCE = 45.0
+# 種子方向的修正次數上限。方向收斂就提前停止，因此好的偵測通常只花一次。
+DEFAULT_SEED_REFINE_STEPS = 4
+# 種子修正的收斂容許角度；方向變化小於此值就停止，省下一次擬合。
+DEFAULT_SEED_CONVERGED_DEGREES = 2.0
+# 候選要與最佳解相差這麼多度，才算「另一種解讀」而構成 90 度翻轉的疑慮。
+DEFAULT_SEED_RIVAL_MIN_ANGLE = 20.0
 # 影像座標中畫面的縱向為 90 度。機器人對準稻草捆長軸時，
 # 目標軸線應與畫面縱向重合，此時角度誤差為 0。
 DEFAULT_ROBOT_ANGLE = 90.0
@@ -489,6 +495,52 @@ def calculate_confidence(side_edges, seed_margin):
 	return float(min(terms.values())), terms
 
 
+def refine_side_edges(
+	contour_points,
+	border_ratio,
+	seed_direction,
+	max_steps=DEFAULT_SEED_REFINE_STEPS,
+):
+	"""以上一輪的擬合結果當新種子反覆擬合，直到方向收斂。
+
+	目標只露出一小截時 mask 接近方形，PCA 主軸可能偏離真實長軸數十度。
+	種子只用來決定分箱的縱向座標，偏太多會讓左右邊界都落在同一側 ——
+	實測有一張圖的兩側中點只相距 14 px，而目標寬度是 260 px。
+	用上一輪算出的方向重新分箱可以逐步修正，通常兩三次就穩定。
+
+	回傳各輪中分數最高者而非最後一輪：迭代可能在兩個方向間震盪，
+	取最佳比取最後可靠。
+	"""
+	best = None
+	best_score = -1.0
+	seed = np.asarray(seed_direction, dtype=np.float32)
+	for _ in range(max_steps):
+		fitted = fit_side_edges(contour_points, border_ratio, seed)
+		if fitted is None:
+			# 這一輪失敗不代表前幾輪無效，保留既有的最佳結果。
+			break
+
+		score = side_straightness(fitted)
+		if score > best_score:
+			best = fitted
+			best_score = score
+
+		# 直線段已經夠長就不必再修正；修正是為了救回種子偏掉的情況，
+		# 對本來就擬得好的影格只是多花一次擬合。
+		if score >= DEFAULT_STRAIGHT_TARGET:
+			break
+
+		next_seed = np.asarray(fitted["direction"], dtype=np.float32)
+		# 方向已經接近種子就不必再試（軸線無正反之分，取絕對值）。
+		if abs(float(np.dot(next_seed, seed))) > np.cos(
+			np.deg2rad(DEFAULT_SEED_CONVERGED_DEGREES)
+		):
+			break
+		seed = next_seed
+
+	return best
+
+
 def analyze_target(target_mask):
 	"""估計目標中心、實際主軸角度、方向向量與可信度。"""
 	# 透視會讓稻草捆的矩形變成梯形，因此用所有前景像素做 PCA，
@@ -523,7 +575,7 @@ def analyze_target(target_mask):
 
 	candidates = []
 	for seed_vector in (pca_vector, perpendicular_vector):
-		fitted = fit_side_edges(contour_points, border_ratio, seed_vector)
+		fitted = refine_side_edges(contour_points, border_ratio, seed_vector)
 		if fitted is not None:
 			candidates.append((side_straightness(fitted), fitted))
 	if not candidates:
@@ -532,11 +584,17 @@ def analyze_target(target_mask):
 
 	candidates.sort(key=lambda item: item[0], reverse=True)
 	best_score, side_edges = candidates[0]
-	runner_up_score = candidates[1][0] if len(candidates) > 1 else 0.0
+	# 只有指向不同軸線的候選才算競爭者。兩個種子收斂到同一個方向代表
+	# 彼此印證，是最可靠的情況，不該被當成模稜兩可。
+	rival_score = 0.0
+	for score, fitted in candidates[1:]:
+		if (
+			axis_angle_difference(fitted["angle"], side_edges["angle"])
+			> DEFAULT_SEED_RIVAL_MIN_ANGLE
+		):
+			rival_score = max(rival_score, score)
 	seed_margin = (
-		(best_score - runner_up_score) / best_score
-		if best_score > 1e-6
-		else 0.0
+		(best_score - rival_score) / best_score if best_score > 1e-6 else 0.0
 	)
 
 	direction = side_edges["direction"]
