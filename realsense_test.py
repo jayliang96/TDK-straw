@@ -17,9 +17,15 @@ RGB 的 auto_exposure_priority 預設開啟，光線一暗驅動會自己把彩�
 --record 會把這次串流錄下來當測試素材。副檔名決定錄什麼：.mp4/.avi 只
 錄彩色（可直接餵給 straw.py --video），.bag 是 SDK 原生格式，彩色與深度
 都留得住，但一分鐘就好幾百 MB。
+
+--photo 是拍照模式：串流照跑，按空白鍵存下當下那一格。存的是原始彩色影格
+（可直接餵給 straw.py --image），有深度時另外存一張 16-bit 灰階 PNG，像素
+值就是 z16 原始的毫米值 —— 畫面上那張 JET 假色只能給人看，數值被壓成
+0~255 就回不來了。跟 --record 可以同時開。
 """
 
 import argparse
+import datetime
 import time
 from pathlib import Path
 
@@ -29,7 +35,10 @@ import pyrealsense2 as rs
 
 # 依頻寬由高到低排列。USB 2.x 撐不住第一組，往下退到能實際出格的組合。
 # 格式為 (說明, 彩色 (寬, 高, fps), 深度 (寬, 高, fps) 或 None)。
+# 第一組的 1280x720 是 D435 深度的上限；彩色本身還能到 1920x1080，但兩條
+# 對齊在同一個解析度比較好比對，而且這組的頻寬已經是 640x480@30 的三倍。
 STREAM_CANDIDATES = [
+    ("1280x720@30 彩色+深度", (1280, 720, 30), (1280, 720, 30)),
     ("640x480@30 彩色+深度", (640, 480, 30), (640, 480, 30)),
     ("640x480@15 彩色+深度", (640, 480, 15), (640, 480, 15)),
     ("424x240@30 彩色 + 480x270@30 深度", (424, 240, 30), (480, 270, 30)),
@@ -159,6 +168,36 @@ def open_recorder(record_path, color):
     return writer
 
 
+def save_photo(photo_dir, color_image, depth_image):
+    """存下一格原始影格，回傳實際寫出的檔案路徑。
+
+    存的是相機送來的原始彩色影格，不是視窗上那張 —— 視窗那張右半邊是深度
+    併圖、左上還有疊字，餵給 straw.py 只會讀到根本不存在的東西。
+
+    深度另外存一張 16-bit 灰階 PNG。像素值就是 z16 的原始值，D435 預設
+    深度單位是 1mm，0 一樣代表立體匹配失敗而不是距離為零。存的是濾波前的
+    值，跟畫面上經過 temporal 平滑的那張不同 —— 當測試素材要的是還帶著
+    雜點的原始資料，先被平滑過就試不出處理流程擋不擋得住。
+    """
+    photo_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 同一秒內連拍會撞名，補流水號；不用毫秒是為了檔名還讀得出來。
+    path = photo_dir / ("shot_%s.png" % stamp)
+    serial = 2
+    while path.exists():
+        path = photo_dir / ("shot_%s_%d.png" % (stamp, serial))
+        serial += 1
+
+    written = []
+    if cv2.imwrite(str(path), color_image):
+        written.append(path)
+    if depth_image is not None:
+        depth_path = path.with_name(path.stem + "_depth.png")
+        if cv2.imwrite(str(depth_path), depth_image):
+            written.append(depth_path)
+    return written
+
+
 def main():
     parser = argparse.ArgumentParser(description="RealSense 串流測試")
     parser.add_argument("--no-depth", action="store_true",
@@ -174,7 +213,13 @@ def main():
                         help="把這次串流錄下來；.mp4/.avi 只錄彩色，"
                              "可直接餵給 straw.py --video，.bag 連深度一起"
                              "錄但檔案大得多")
+    parser.add_argument("--photo", metavar="DIR", nargs="?", const="data",
+                        help="拍照模式：按空白鍵存下當下的原始彩色影格到 DIR"
+                             "（不給就是 data/），有深度時一併存 16-bit "
+                             "深度 PNG")
     args = parser.parse_args()
+
+    photo_dir = Path(args.photo) if args.photo is not None else None
 
     near_mm, far_mm = (round(v * 1000.0) for v in args.depth_range)
 
@@ -206,6 +251,8 @@ def main():
     if record_path is not None:
         print("錄影中：%s（%s）。按 ESC 停止並收檔。"
               % (record_path, "彩色+深度 bag" if record_bag else "彩色影片"))
+    if photo_dir is not None:
+        print("拍照模式：按空白鍵存一張到 %s。" % photo_dir)
 
     # 時間濾波拿前幾格做加權，實測可以把破洞從 22.4% 降到 21.0%、有效值的
     # 逐格抖動壓掉約 1.6mm。它擋不掉邊緣的假距離(紅點)：預設 delta 是 20mm，
@@ -226,6 +273,7 @@ def main():
     previous_number = None
     recorded = 0
     record_start = time.perf_counter()
+    captured = 0
 
     try:
         while True:
@@ -257,7 +305,13 @@ def main():
                     depth_colormap = cv2.resize(
                         depth_colormap, (images.shape[1], images.shape[0])
                     )
-                images = np.hstack((images, depth_colormap))
+                display = np.hstack((images, depth_colormap))
+            else:
+                # 疊字一律畫在 display 上，images 要留著原封不動的影格給
+                # 錄影與拍照。有深度時 hstack 本來就會產生新陣列，沒有時
+                # images 是 librealsense 緩衝區的 view，得自己複製一份，
+                # 否則存出去的檔案上會有那幾行給人看的字。
+                display = images.copy()
 
             shown += 1
             elapsed = time.perf_counter() - window_start
@@ -266,20 +320,37 @@ def main():
                 shown = 0
                 window_start = time.perf_counter()
 
-            cv2.putText(
-                images, "%.1f fps  dropped %d  USB %s" % (fps, dropped, usb),
-                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
-            )
+            lines = [("%.1f fps  dropped %d  USB %s" % (fps, dropped, usb),
+                      (0, 255, 0))]
             if record_path is not None:
-                cv2.putText(
-                    images,
-                    "REC %.1fs  %d frames"
-                    % (time.perf_counter() - record_start, recorded),
-                    (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
-                )
-            cv2.imshow('RealSense D435', images)
-            if cv2.waitKey(1) == 27:  # ESC 離開
+                lines.append(("REC %.1fs  %d frames"
+                              % (time.perf_counter() - record_start, recorded),
+                              (0, 0, 255)))
+            if photo_dir is not None:
+                lines.append(("SPACE to shoot  %d saved" % captured,
+                              (0, 255, 255)))
+            for row, (text, text_color) in enumerate(lines):
+                cv2.putText(display, text, (10, 24 + row * 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+
+            cv2.imshow('RealSense D435', display)
+            key = cv2.waitKey(1)
+            if key == 27:  # ESC 離開
                 break
+            if photo_dir is not None and key == 32:  # 空白鍵拍照
+                # 這裡重拿一次深度：上面那個 depth_frame 已經被 temporal
+                # 換成濾波後的版本，而存檔要的是原始值。
+                raw_depth_frame = frames.get_depth_frame()
+                written = save_photo(
+                    photo_dir, images,
+                    np.asanyarray(raw_depth_frame.get_data())
+                    if raw_depth_frame else None,
+                )
+                if written:
+                    captured += 1
+                    print("已存 %s" % "、".join(str(p) for p in written))
+                else:
+                    print("寫檔失敗，請確認 %s 可以寫入。" % photo_dir)
     finally:
         # bag 由 pipeline.stop() 收尾，mp4 由 writer.release() 補完索引；
         # 少了任何一邊檔案都會是壞的，所以放在 finally 裡。
@@ -293,6 +364,9 @@ def main():
                    if record_path.exists() else 0.0)
         print("錄影已儲存：%s（%d 格，%.1f MB，期間掉格 %d）"
               % (record_path, recorded, size_mb, dropped))
+
+    if photo_dir is not None:
+        print("拍照模式：共存了 %d 張到 %s。" % (captured, photo_dir))
 
 
 if __name__ == "__main__":
