@@ -67,6 +67,10 @@ DEFAULT_STRAIGHT_FLOOR = 0.5
 DEFAULT_STRAIGHT_TARGET = 0.85
 DEFAULT_ANGLE_SIGMA_LIMIT = 2.0
 DEFAULT_SEED_MARGIN_TARGET = 0.25
+# 沒指定 --calibration 時自動找這個檔。在機器上忘記帶參數會讓機器人
+# 瞄偏一個相機側偏的距離，而畫面看起來完全正常；預設載入才是安全的
+# 那一邊。載入時一律在 stderr 印出實際採用的偏差，不會無聲生效。
+DEFAULT_CALIBRATION_FILE = "axis_calibration.json"
 DEFAULT_IMAGE_OUTPUT = "output/straw_detection.png"
 DEFAULT_VIDEO_OUTPUT = "output/straw_detection.mp4"
 
@@ -1865,7 +1869,13 @@ def parse_args():
 	parser.add_argument(
 		"--calibration",
 		default=None,
-		help="讀入 --calibrate 產生的校正檔；個別參數若明確指定則優先",
+		help="讀入 --calibrate 產生的校正檔；個別參數若明確指定則優先。"
+		"未指定時自動找 %s" % DEFAULT_CALIBRATION_FILE,
+	)
+	parser.add_argument(
+		"--no-calibration",
+		action="store_true",
+		help="不要自動載入 %s" % DEFAULT_CALIBRATION_FILE,
 	)
 	parser.add_argument(
 		"--calibrate",
@@ -1894,10 +1904,19 @@ def parse_args():
 
 
 def resolve_alignment(args):
-	"""決定這次要用的安裝偏差：命令列 > 校正檔 > 預設值。"""
+	"""決定這次要用的安裝偏差：命令列 > 校正檔 > 預設值。
+
+	沒指定 --calibration 時會自動找 DEFAULT_CALIBRATION_FILE，找不到就
+	維持零偏差。校正模式本身在量絕對值，不套用任何既有校正。
+	"""
 	stored = {}
-	if args.calibration is not None:
-		stored = load_calibration(args.calibration)
+	path = args.calibration
+	if path is None and not args.no_calibration and not args.calibrate:
+		default_path = Path(DEFAULT_CALIBRATION_FILE)
+		if default_path.is_file():
+			path = default_path
+	if path is not None:
+		stored = load_calibration(path)
 
 	def pick(explicit, key, fallback):
 		if explicit is not None:

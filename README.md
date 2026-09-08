@@ -245,9 +245,15 @@ python straw.py --realsense --calibrate axis_calibration.json
 # 或用一張擺好位置的參考圖
 python straw.py --image data/aligned.jpg --calibrate axis_calibration.json
 
-# 之後每次執行都帶上校正檔
-python straw.py --realsense --robot --calibration axis_calibration.json
+# 之後直接跑就好，會自動載入 axis_calibration.json
+python straw.py --realsense --robot
+
+# 要換一份校正檔，或暫時不套用
+python straw.py --realsense --calibration other.json
+python straw.py --realsense --no-calibration
 ```
+
+**校正檔預設會自動載入。** 檔名為 `axis_calibration.json`，放在執行目錄下就會生效 —— 在機器上忘記帶參數會讓機器人瞄偏一個相機側偏的距離，而畫面看起來完全正常，所以預設載入才是安全的那一邊。載入時一律在 stderr 印出實際採用的偏差，不會無聲生效。ROS2 節點沒有這個預設（工作目錄不定），要用 `calibration_file` 參數明確指定。
 
 這比量測相機的安裝位置好，不只是省事：它一次吸收 roll、偏航、鏡頭畸變、光心偏移，以及**夾爪相對機器人中心的偏移**。真正要問的問題不是「機器人中軸線在哪」，而是「稻草捆要出現在哪，夾爪才夾得到」—— 後者拿尺量不出來。
 
@@ -305,7 +311,8 @@ ratio 以半畫面寬為單位，純粹縮放（1280x720 → 640x360）不受影
 | 校正參數 | 預設 | 說明 |
 |---|---|---|
 | `--calibrate PATH` | 無 | 進入校正模式，把結果寫到這個路徑 |
-| `--calibration PATH` | 無 | 讀入校正檔；個別參數若在命令列明確指定則優先 |
+| `--calibration PATH` | 自動找 `axis_calibration.json` | 讀入校正檔；個別參數若在命令列明確指定則優先 |
+| `--no-calibration` | 關 | 不要自動載入預設校正檔 |
 | `--calibrate-seconds` | `1.0` | 影片來源取最後幾秒當作正確姿態 |
 | `--calibrate-frames` | `30` | 即時來源要收集幾格可用影格 |
 
@@ -397,7 +404,8 @@ ros2 topic echo /straw/target
 | `--axis-offset-m` | `0.0` | 相機相對瞄準軸的側偏（公尺，正為右），有深度時使用 |
 | `--axis-offset-ratio` | `0.0` | 同上，以半畫面寬為單位，沒有深度時使用 |
 | `--axis-yaw-deg` | `0.0` | 相機偏航（度，正為朝右） |
-| `--calibration` | 無 | 讀入校正檔；個別參數若明確指定則優先 |
+| `--calibration` | 自動找 `axis_calibration.json` | 讀入校正檔；個別參數若明確指定則優先 |
+| `--no-calibration` | 關 | 不要自動載入預設校正檔 |
 | `--calibrate` | 無 | 進入校正模式並把結果寫到這個路徑 |
 | `--calibrate-seconds` | `1.0` | 影片來源取最後幾秒 |
 | `--calibrate-frames` | `30` | 即時來源要收集幾格 |
