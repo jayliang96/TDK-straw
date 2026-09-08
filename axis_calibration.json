@@ -1,0 +1,13 @@
+{
+  "robot_angle": 84.85,
+  "axis_offset_m": -0.1481,
+  "axis_offset_ratio": 0.35859,
+  "axis_yaw_deg": 0.0,
+  "depth_calibrated": true,
+  "reference_distance_m": 0.619,
+  "image_width": 1280,
+  "source": "realsense",
+  "samples": 30,
+  "angle_spread_deg": 0.21,
+  "ratio_spread": 0.00094
+}

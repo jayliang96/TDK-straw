@@ -25,12 +25,13 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 
-from straw import (DEFAULT_DEPTH_PATCH_RADIUS, DEFAULT_DEPTH_SCALE,
-                   DEFAULT_FILTER_ALPHA, DEFAULT_LOWER_HSV,
-                   DEFAULT_MIN_AREA, DEFAULT_MIN_CONFIDENCE,
+from straw import (DEFAULT_AXIS_OFFSET_M, DEFAULT_AXIS_OFFSET_RATIO,
+                   DEFAULT_AXIS_YAW_DEG, DEFAULT_DEPTH_PATCH_RADIUS,
+                   DEFAULT_DEPTH_SCALE, DEFAULT_FILTER_ALPHA,
+                   DEFAULT_LOWER_HSV, DEFAULT_MIN_AREA, DEFAULT_MIN_CONFIDENCE,
                    DEFAULT_MORPHOLOGY_KERNEL, DEFAULT_ROBOT_ANGLE,
-                   DEFAULT_UPPER_HSV, AxisAngleFilter, build_depth_fields,
-                   process_frame)
+                   DEFAULT_UPPER_HSV, AxisAlignment, AxisAngleFilter,
+                   build_depth_fields, load_calibration, process_frame)
 
 
 class DetectionSettings:
@@ -41,11 +42,43 @@ class DetectionSettings:
 		self.upper_hsv = list(node.get_parameter("upper_hsv").value)
 		self.kernel_size = int(node.get_parameter("kernel_size").value)
 		self.min_area = int(node.get_parameter("min_area").value)
-		self.robot_angle = float(node.get_parameter("robot_angle").value)
+		self.alignment = build_alignment(node)
 		# process_frame 會用它決定標註圖上的軸線顏色。
 		self.min_confidence = float(
 			node.get_parameter("min_confidence").value
 		)
+
+
+def build_alignment(node):
+	"""組出相機的安裝偏差：參數 > 校正檔 > 預設值。
+
+	參數的預設值刻意等於 straw.py 的預設值，因此「參數沒被覆寫」與
+	「參數被設成預設值」無法區分；校正檔要生效就別去動這幾個參數。
+	"""
+	stored = {}
+	calibration_file = node.get_parameter("calibration_file").value
+	if calibration_file:
+		stored = load_calibration(calibration_file)
+		node.get_logger().info("讀入校正檔: %s" % calibration_file)
+
+	def pick(name, key, fallback):
+		value = float(node.get_parameter(name).value)
+		if value != fallback:
+			return value
+		return float(stored.get(key, fallback))
+
+	alignment = AxisAlignment(
+		robot_angle=pick("robot_angle", "robot_angle", DEFAULT_ROBOT_ANGLE),
+		offset_m=pick("axis_offset_m", "axis_offset_m", DEFAULT_AXIS_OFFSET_M),
+		offset_ratio=pick(
+			"axis_offset_ratio",
+			"axis_offset_ratio",
+			DEFAULT_AXIS_OFFSET_RATIO,
+		),
+		yaw_deg=pick("axis_yaw_deg", "axis_yaw_deg", DEFAULT_AXIS_YAW_DEG),
+	)
+	node.get_logger().info("安裝偏差: %s" % alignment.describe())
+	return alignment
 
 
 class StrawDetectorNode(Node):
@@ -80,6 +113,10 @@ class StrawDetectorNode(Node):
 		self.declare_parameter("kernel_size", DEFAULT_MORPHOLOGY_KERNEL)
 		self.declare_parameter("min_area", DEFAULT_MIN_AREA)
 		self.declare_parameter("robot_angle", DEFAULT_ROBOT_ANGLE)
+		self.declare_parameter("axis_offset_m", DEFAULT_AXIS_OFFSET_M)
+		self.declare_parameter("axis_offset_ratio", DEFAULT_AXIS_OFFSET_RATIO)
+		self.declare_parameter("axis_yaw_deg", DEFAULT_AXIS_YAW_DEG)
+		self.declare_parameter("calibration_file", "")
 
 		self.settings = DetectionSettings(self)
 		self.min_confidence = float(self.get_parameter("min_confidence").value)
@@ -237,6 +274,7 @@ class StrawDetectorNode(Node):
 			self.intrinsics,
 			self.depth_patch_radius,
 			self.depth_scale,
+			self.settings.alignment,
 		)
 
 	def publish_payload(self, payload, source_message):

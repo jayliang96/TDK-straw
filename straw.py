@@ -5,7 +5,9 @@
 """
 
 import argparse
+import collections
 import json
+import sys
 import threading
 import time
 from pathlib import Path
@@ -37,6 +39,18 @@ DEFAULT_SEED_RIVAL_MIN_LENGTH = 0.7
 # 影像座標中畫面的縱向為 90 度。機器人對準稻草捆長軸時，
 # 目標軸線應與畫面縱向重合，此時角度誤差為 0。
 DEFAULT_ROBOT_ANGLE = 90.0
+# 相機相對機器人瞄準軸的安裝偏差，預設為零（相機裝在中軸線上正對前方）。
+# 三者由 --calibrate 一次量出，見 AxisAlignment。
+DEFAULT_AXIS_OFFSET_M = 0.0
+DEFAULT_AXIS_OFFSET_RATIO = 0.0
+DEFAULT_AXIS_YAW_DEG = 0.0
+# 校正取樣：影片取最後這幾秒，即時來源收集這麼多格。
+DEFAULT_CALIBRATION_SECONDS = 1.0
+DEFAULT_CALIBRATION_FRAMES = 30
+# 校正離散度上限。超過代表這段畫面裡的姿態根本不穩，寧可不寫檔：
+# 一個看似合理的壞校正會讓之後每一格都偏，而且不會有任何徵兆。
+DEFAULT_CALIBRATION_MAX_ANGLE_SPREAD = 5.0
+DEFAULT_CALIBRATION_MAX_RATIO_SPREAD = 0.10
 DEFAULT_FILTER_ALPHA = 0.25
 # 機器運行模式的可信度門檻；錯誤的讀數會直接變成錯誤的動作。
 DEFAULT_MIN_CONFIDENCE = 0.5
@@ -651,6 +665,108 @@ def calculate_heading_error(target_angle, robot_angle=DEFAULT_ROBOT_ANGLE):
 	return (target_angle - robot_angle + 90.0) % 180.0 - 90.0
 
 
+class AxisAlignment:
+	"""相機相對機器人瞄準軸的安裝偏差。
+
+	預設全為零，等同相機裝在中軸線上正對前方 —— 與加入本機制之前的
+	行為完全相同，既有用法不受影響。
+
+	`offset_m` 是相機的側偏（公尺，正為右）。相機在軸線右側 d 公尺時，
+	目標落在畫面正中央代表它其實也在軸線右側 d 公尺，所以換算是**加**
+	不是減。有深度時走這條路，與距離無關。
+
+	`offset_ratio` 是同一件事在校正距離上的像素表現（以半畫面寬為單位）。
+	相機側偏在畫面上不是固定的像素位移，而是 fx·d/Z，隨距離變動；沒有
+	深度就只能固定在校正距離上，收斂後的殘留偏差為 d·(1 - Z/Z_ref)，
+	在校正距離為零。因此校正應該在機器人真正要停的位置做。
+
+	兩者由同一次校正一起產生，在校正距離上必定一致，深度掉格時控制端
+	在 lateral_error_m 與 lateral_error_ratio 之間切換不會看到跳變。
+
+	`yaw_deg` 是相機的偏航（正為朝右）。忽略它的殘留偏差是
+	(Z - Z_ref)·tan(yaw)，同樣在校正距離為零，因此預設為 0；要補的話
+	在兩個距離各量一次 lateral_error_m，斜率就是 tan(yaw)。
+	"""
+
+	def __init__(
+		self,
+		robot_angle=DEFAULT_ROBOT_ANGLE,
+		offset_m=DEFAULT_AXIS_OFFSET_M,
+		offset_ratio=DEFAULT_AXIS_OFFSET_RATIO,
+		yaw_deg=DEFAULT_AXIS_YAW_DEG,
+		image_width=None,
+	):
+		self.robot_angle = float(robot_angle)
+		self.offset_m = float(offset_m)
+		self.offset_ratio = float(offset_ratio)
+		self.yaw_deg = float(yaw_deg)
+		# 校正時的畫面寬度，用來擋下「換了解析度卻沿用同一個 ratio」。
+		self.image_width = (
+			int(image_width) if image_width is not None else None
+		)
+		self.warned_width = False
+
+	def to_camera_axis(self, x_metres, z_metres):
+		"""把相機座標的橫向位移換算成相對機器人瞄準軸的位移。"""
+		yaw = np.deg2rad(self.yaw_deg)
+		return (
+			x_metres * np.cos(yaw) + z_metres * np.sin(yaw) + self.offset_m
+		)
+
+	def aim_x(self, image_width):
+		"""瞄準軸在畫面上的像素橫座標；偏差為零時就是畫面中線。
+
+		基準刻意維持畫面中線而非光心 cx：校正量到的是「瞄準點在哪」，
+		光心偏移已經含在裡面，換基準不會改變結果，反而會讓沒有內參的
+		來源（影片、一般相機）與 RealSense 用不同基準。
+		"""
+		self.check_image_width(image_width)
+		half_width = image_width / 2.0
+		return half_width + self.offset_ratio * half_width
+
+	def check_image_width(self, image_width):
+		"""換了解析度卻沿用同一個 offset_ratio 時警告一次。
+
+		ratio 以半畫面寬為單位，純粹縮放（1280x720 -> 640x360）不受影響，
+		但改變長寬比會換掉感測器的裁切範圍，水平視角跟著變 —— 實測同一
+		台 D435 在 640x480 量到 0.478、1280x720 量到 0.359。此時 ratio
+		會靜靜地錯掉，而 axis_offset_m 不受影響。
+		"""
+		if self.warned_width or self.image_width is None:
+			return
+		if self.offset_ratio == 0.0 or int(image_width) == self.image_width:
+			return
+		self.warned_width = True
+		print(
+			"警告：校正時畫面寬 %d，現在是 %d。axis_offset_ratio 只在原本的"
+			"視角下正確，換長寬比會失準（axis_offset_m 不受影響）。"
+			"請以現在的解析度重新校正。"
+			% (self.image_width, int(image_width)),
+			file=sys.stderr,
+		)
+
+	def is_default(self):
+		"""是否等同「相機裝在中軸線上正對前方」。"""
+		return (
+			self.robot_angle == DEFAULT_ROBOT_ANGLE
+			and self.offset_m == DEFAULT_AXIS_OFFSET_M
+			and self.offset_ratio == DEFAULT_AXIS_OFFSET_RATIO
+			and self.yaw_deg == DEFAULT_AXIS_YAW_DEG
+		)
+
+	def describe(self):
+		return (
+			"robot_angle=%.2f deg  axis_offset_m=%+.3f m  "
+			"axis_offset_ratio=%+.4f  axis_yaw_deg=%+.2f deg"
+			% (
+				self.robot_angle,
+				self.offset_m,
+				self.offset_ratio,
+				self.yaw_deg,
+			)
+		)
+
+
 def sample_depth_patch(
 	depth_image,
 	center_px,
@@ -686,11 +802,16 @@ def build_depth_fields(
 	intrinsics,
 	radius=DEFAULT_DEPTH_PATCH_RADIUS,
 	depth_scale=DEFAULT_DEPTH_SCALE,
+	alignment=None,
 ):
 	"""把目標中心像素還原成相機座標系的公尺座標。
 
 	intrinsics 為 (fx, fy, cx, cy)。回傳的欄位一律存在，has_depth 說明
 	這次有沒有取到有效深度，控制端不必用「欄位在不在」來判斷。
+
+	alignment 為相機的安裝偏差；lateral_error_m 是**相對機器人瞄準軸**
+	的位移，position_m 與 camera_lateral_m 則維持原始相機座標，校正與
+	除錯要看未補償的值時用後者。
 	"""
 	missing = {"has_depth": False}
 	if depth_image is None or intrinsics is None:
@@ -702,38 +823,49 @@ def build_depth_fields(
 	if depth_metres is None:
 		return missing
 
+	if alignment is None:
+		alignment = AxisAlignment()
 	fx, fy, cx, cy = intrinsics
 	# 針孔模型反投影。x 向右、y 向下、z 向前，單位公尺。
 	x = (float(center_px[0]) - cx) * depth_metres / fx
 	y = (float(center_px[1]) - cy) * depth_metres / fy
+	lateral = float(alignment.to_camera_axis(x, depth_metres))
 	return {
 		"has_depth": True,
 		"distance_m": round(depth_metres, 4),
-		"lateral_error_m": round(x, 4),
+		"lateral_error_m": round(lateral, 4),
+		"camera_lateral_m": round(x, 4),
 		"position_m": [round(x, 4), round(y, 4), round(depth_metres, 4)],
 	}
 
 
-def calculate_control_errors(result, image_width, robot_angle=DEFAULT_ROBOT_ANGLE):
+def calculate_control_errors(result, image_width, alignment=None):
 	"""計算要回傳給機器人的兩個控制量。
 
 	角度誤差：目標長軸與機器人前進方向的夾角，0 代表已對正。
 	正值代表目標頂端偏向畫面右側。
 
-	橫向誤差：目標中心相對畫面中線的水平位移，0 代表已對中。
-	正值代表目標位於中線右側。相機裝在機器人中線上，畫面中線即機器人中線。
+	橫向誤差：目標中心相對機器人瞄準軸的水平位移，0 代表已對中。
+	正值代表目標位於瞄準軸右側。相機裝在中軸線上時瞄準軸就是畫面中線；
+	相機偏離中軸線時由 alignment.offset_ratio 把瞄準點移到正確的位置。
 
 	橫向誤差同時提供像素值與正規化值。正規化值以半個畫面寬為單位，
 	範圍約 [-1, 1]，不受解析度影響，控制端不必知道相機規格即可使用。
 	像素值要換算成實際距離則需要相機標定與目標距離，本程式不提供。
 	"""
-	heading_error = calculate_heading_error(result["angle"], robot_angle)
+	if alignment is None:
+		alignment = AxisAlignment()
+	heading_error = calculate_heading_error(
+		result["angle"], alignment.robot_angle
+	)
 	half_width = image_width / 2.0
-	lateral_error = float(result["center"][0]) - half_width
+	aim_x = alignment.aim_x(image_width)
+	lateral_error = float(result["center"][0]) - aim_x
 	return {
 		"heading_error": float(heading_error),
 		"lateral_error": lateral_error,
 		"lateral_error_ratio": lateral_error / half_width,
+		"aim_x": aim_x,
 	}
 
 
@@ -829,18 +961,29 @@ def make_visualization(
 				tipLength=0.35,
 			)
 
-	# 綠色垂直線是機器人中線，橫線標出目標中心離中線多遠。
+	# 綠色垂直線是機器人瞄準軸，橫線標出目標中心離它多遠。
+	# 相機不在中軸線上時瞄準軸會離開畫面中線，此時另外用細灰線標出
+	# 畫面中線，才看得出補償了多少。
+	aim_x = int(round(errors.get("aim_x", visualization.shape[1] / 2.0)))
 	middle_x = visualization.shape[1] // 2
+	if aim_x != middle_x:
+		cv2.line(
+			visualization,
+			(middle_x, 0),
+			(middle_x, visualization.shape[0]),
+			(120, 120, 120),
+			1,
+		)
 	cv2.line(
 		visualization,
-		(middle_x, 0),
-		(middle_x, visualization.shape[0]),
+		(aim_x, 0),
+		(aim_x, visualization.shape[0]),
 		(0, 255, 0),
 		2,
 	)
 	cv2.line(
 		visualization,
-		(middle_x, center[1]),
+		(aim_x, center[1]),
 		(center[0], center[1]),
 		(0, 255, 0),
 		4,
@@ -894,7 +1037,7 @@ def process_frame(frame_bgr, args, angle_filter, build_visualization=True):
 
 	result = apply_angle_filter(result, angle_filter)
 	errors = calculate_control_errors(
-		result, frame_bgr.shape[1], args.robot_angle
+		result, frame_bgr.shape[1], args.alignment
 	)
 	visualization = None
 	if build_visualization:
@@ -1040,10 +1183,13 @@ class RealSenseCapture:
 
 		return True, np.asanyarray(color_frame.get_data())
 
-	def describe_depth(self, center_px):
+	def describe_depth(self, center_px, alignment=None):
 		"""目標中心的公尺座標，供 run_on_stream 併進輸出。"""
 		return build_depth_fields(
-			center_px, self.depth_image, self.intrinsics
+			center_px,
+			self.depth_image,
+			self.intrinsics,
+			alignment=alignment,
 		)
 
 	def get(self, prop):
@@ -1175,7 +1321,11 @@ def run_on_stream(capture, args):
 				# RealSense 輸入才有深度，其餘來源沒有這個方法。
 				if has_depth_source:
 					payload = dict(payload)
-					payload.update(capture.describe_depth(result["center"]))
+					payload.update(
+						capture.describe_depth(
+							result["center"], args.alignment
+						)
+					)
 				# 可信度不足時視同沒有偵測到：寧可讓控制端維持前一個指令，
 				# 也不要送出一個看似合理但方向可能錯 90 度的誤差。
 				if result["confidence"] < args.min_confidence:
@@ -1248,7 +1398,15 @@ def build_input_mask(args):
 
 
 def apply_angle_filter(result, angle_filter):
-	"""套用跨影格軸線濾波，並更新繪圖與控制使用的方向。"""
+	"""套用跨影格軸線濾波，並更新繪圖與控制使用的方向。
+
+	angle_filter 為 None 時不平滑，直接沿用本格的原始角度。校正走這條
+	路：濾波的暖機過渡會混進取樣視窗，而多格取中位數本來就比指數平滑
+	更能抗離群值。
+	"""
+	if angle_filter is None:
+		return result
+
 	filtered_angle = angle_filter.update(result["angle"])
 	result["filtered_angle"] = filtered_angle
 	result["angle"] = filtered_angle
@@ -1275,6 +1433,288 @@ def save_outputs(
 	cv2.imwrite(
 		str(output_path.with_name("straw_target_mask.png")), target_mask
 	)
+
+
+def axis_angle_median(angles):
+	"""軸線角度的中位數。
+
+	軸線角度是 180 度週期的：179 度與 1 度其實只差 2 度，直接取中位數
+	會在繞回處算出離譜的值。先以第一筆為參考把每個角度展開到 ±90 度內，
+	取完中位數再折回 [0, 180)。
+	"""
+	reference = float(angles[0])
+	unwrapped = [
+		reference + ((float(angle) - reference + 90.0) % 180.0 - 90.0)
+		for angle in angles
+	]
+	return float(np.median(unwrapped)) % 180.0
+
+
+def axis_angle_spread(angles, centre):
+	"""這批軸線角度相對 centre 的全距，單位為度。"""
+	deltas = [
+		(float(angle) - centre + 90.0) % 180.0 - 90.0 for angle in angles
+	]
+	return float(max(deltas) - min(deltas))
+
+
+def collect_calibration_samples(
+	capture, args, keep, stop_when_full=False, max_frames=None
+):
+	"""逐格量測校正用的原始值，只留最後 keep 格。
+
+	只收可信度過門檻的影格。校正一旦寫進檔案，之後每一格都會用到它，
+	讓一次錯誤的偵測去定義瞄準軸是最糟的失敗方式 —— 結果看起來完全
+	正常，只是每一格都偏。
+
+	影格取樣不套用軸線濾波（angle_filter 傳 None）：濾波的暖機過渡會
+	混進取樣視窗，而多格取中位數本來就比指數平滑更能抗離群值。
+	"""
+	threshold = display_confidence_threshold(args)
+	has_depth_source = hasattr(capture, "describe_depth")
+	samples = collections.deque(maxlen=keep)
+	frames_read = 0
+	reported = 0
+
+	while True:
+		ok, frame = capture.read()
+		if not ok:
+			break
+		frames_read += 1
+		outcome = process_frame(frame, args, None, False)
+		if outcome is not None:
+			payload = outcome["payload"]
+			if payload["confidence"] >= threshold:
+				if has_depth_source:
+					payload = dict(payload)
+					payload.update(
+						capture.describe_depth(outcome["result"]["center"])
+					)
+				samples.append(payload)
+		if stop_when_full:
+			if len(samples) >= 10 and len(samples) // 10 > reported:
+				reported = len(samples) // 10
+				print(f"已收集 {len(samples)}/{keep} 格")
+			if len(samples) == keep:
+				break
+		if max_frames is not None and frames_read >= max_frames:
+			break
+
+	return list(samples), frames_read
+
+
+def solve_calibration(samples, image_width, source_name):
+	"""從校正取樣解出相機的安裝偏差。
+
+	一律取中位數而非平均：偶爾一格會把軸線判成 90 度翻轉，平均會被
+	這種離群值拉走，中位數不會。
+
+	正確姿態下目標相對瞄準軸的位移應為零，因此量到多少位移，相機就是
+	往反方向偏了多少 —— 所以 offset 取負號。
+	"""
+	angles = [sample["angle_deg"] for sample in samples]
+	robot_angle = axis_angle_median(angles)
+
+	half_width = image_width / 2.0
+	ratios = [
+		(float(sample["center_px"][0]) - half_width) / half_width
+		for sample in samples
+	]
+	offset_ratio = float(np.median(ratios))
+
+	# 有深度的取樣才能定出與距離無關的公尺側偏。兩個 offset 取自同一批
+	# 影格，因此在校正距離上必定一致，深度掉格時控制端在
+	# lateral_error_m 與 lateral_error_ratio 之間切換不會看到跳變。
+	depth_samples = [sample for sample in samples if sample.get("has_depth")]
+	if depth_samples:
+		offset_m = -float(
+			np.median(
+				[sample["camera_lateral_m"] for sample in depth_samples]
+			)
+		)
+		reference_distance = round(
+			float(
+				np.median([sample["distance_m"] for sample in depth_samples])
+			),
+			4,
+		)
+	else:
+		offset_m = DEFAULT_AXIS_OFFSET_M
+		reference_distance = None
+
+	return {
+		"robot_angle": round(robot_angle, 3),
+		"axis_offset_m": round(offset_m, 4),
+		"axis_offset_ratio": round(offset_ratio, 5),
+		# yaw 不由單一姿態決定：它與側偏在單一距離上完全簡併。要補的話
+		# 在兩個距離各量一次 lateral_error_m，斜率就是 tan(yaw)。
+		"axis_yaw_deg": DEFAULT_AXIS_YAW_DEG,
+		"depth_calibrated": bool(depth_samples),
+		"reference_distance_m": reference_distance,
+		"image_width": int(image_width),
+		"source": source_name,
+		"samples": len(samples),
+		"angle_spread_deg": round(axis_angle_spread(angles, robot_angle), 3),
+		"ratio_spread": round(float(max(ratios) - min(ratios)), 5),
+	}
+
+
+def check_calibration(calibration):
+	"""離散度過大時回傳拒絕的理由，通過則回傳 None。"""
+	if calibration["angle_spread_deg"] > DEFAULT_CALIBRATION_MAX_ANGLE_SPREAD:
+		return (
+			"軸線角度在取樣視窗內散佈 %.1f 度，超過上限 %.1f 度"
+			% (
+				calibration["angle_spread_deg"],
+				DEFAULT_CALIBRATION_MAX_ANGLE_SPREAD,
+			)
+		)
+	if calibration["ratio_spread"] > DEFAULT_CALIBRATION_MAX_RATIO_SPREAD:
+		return (
+			"目標中心在取樣視窗內散佈 %.3f 個半畫面寬，超過上限 %.3f"
+			% (
+				calibration["ratio_spread"],
+				DEFAULT_CALIBRATION_MAX_RATIO_SPREAD,
+			)
+		)
+	return None
+
+
+def save_calibration(path, calibration):
+	"""把校正結果寫成 JSON。"""
+	path = Path(path)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(
+		json.dumps(calibration, ensure_ascii=False, indent=2) + "\n",
+		encoding="utf-8",
+	)
+
+
+def load_calibration(path):
+	"""讀入校正檔。只有四個參數欄位參與運算，其餘是診斷用的紀錄。"""
+	data = json.loads(Path(path).read_text(encoding="utf-8"))
+	if not data.get("depth_calibrated", True):
+		# 沒有深度的來源量不出公尺側偏。此時若拿去跑 --realsense，
+		# lateral_error_m 不會被補償，會與已補償的 lateral_error_ratio
+		# 不一致，正是本機制想避免的跳變。
+		print(
+			"警告：%s 是在沒有深度的來源上校正的，axis_offset_m 仍為 0。"
+			"有深度時 lateral_error_m 不會被補償，會與已補償的 "
+			"lateral_error_ratio 不一致；請用 --realsense 重新校正，"
+			"或手動填入 axis_offset_m。" % path,
+			file=sys.stderr,
+		)
+	return data
+
+
+def report_calibration(calibration, args, frames_read):
+	"""印出校正結果並決定要不要寫檔。"""
+	print(f"取樣來源: {calibration['source']}")
+	print(f"讀取 {frames_read} 格，其中 {calibration['samples']} 格可用")
+	print(
+		f"角度離散: {calibration['angle_spread_deg']:.2f} deg  "
+		f"中心離散: {calibration['ratio_spread']:.4f} 半畫面寬"
+	)
+	print(f"robot_angle: {calibration['robot_angle']:.2f} deg")
+	print(f"axis_offset_ratio: {calibration['axis_offset_ratio']:+.5f}")
+	if calibration["depth_calibrated"]:
+		print(f"axis_offset_m: {calibration['axis_offset_m']:+.4f} m")
+		print(f"校正距離: {calibration['reference_distance_m']:.3f} m")
+	else:
+		print("axis_offset_m: 無深度來源，未能量出（維持 0）")
+
+	reason = check_calibration(calibration)
+	if reason is not None:
+		raise RuntimeError(
+			"校正未寫入：%s。\n"
+			"這段畫面裡的姿態不夠穩定，寫進去的會是一個看似合理的錯誤"
+			"瞄準軸。請確認取樣視窗內機器人與稻草捆都靜止，或改用 "
+			"--calibrate-seconds 縮短視窗。" % reason
+		)
+
+	save_calibration(args.calibrate, calibration)
+	print(f"校正檔已儲存: {args.calibrate}")
+	if not calibration["depth_calibrated"]:
+		print(
+			"提醒：這份校正只補償像素/比例路徑，且只在校正距離上準確。"
+			"要與距離無關的補償，請用 --realsense 重新校正一次。"
+		)
+
+
+def run_calibration(capture, args, source_name, live):
+	"""收集取樣、解出安裝偏差並寫檔。
+
+	校正量的是「瞄準點絕對在哪」，因此取樣期間一律用零偏差；沿用既有的
+	校正檔會讓這次的結果變成相對於上一次的增量。
+	"""
+	args.alignment = AxisAlignment()
+	try:
+		if live:
+			keep = args.calibrate_frames
+			print(f"請保持在正確姿態，收集 {keep} 格可用影格…")
+			samples, frames_read = collect_calibration_samples(
+				capture, args, keep, True, max_frames=keep * 30
+			)
+			image_width = None
+		else:
+			fps = capture.get(cv2.CAP_PROP_FPS)
+			if not fps or fps <= 1e-2:
+				fps = 30.0
+			keep = max(1, int(round(fps * args.calibrate_seconds)))
+			frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+			if frame_count and frame_count > keep:
+				# 只要最後 keep 格，把前面全部解碼是白費工。seek 可能落在
+				# 稍早的關鍵格上，但 deque 只留最後 keep 格，取樣視窗不受
+				# 影響；seek 失敗也只是退回從頭讀，結果一樣。
+				capture.set(
+					cv2.CAP_PROP_POS_FRAMES, float(frame_count - keep)
+				)
+			print(
+				f"取影片最後 {args.calibrate_seconds:.1f} 秒（{keep} 格）"
+				"作為正確姿態"
+			)
+			samples, frames_read = collect_calibration_samples(
+				capture, args, keep
+			)
+			image_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+	finally:
+		capture.release()
+
+	if not samples:
+		raise RuntimeError(
+			"取樣視窗內沒有任何可信度達 %.2f 的影格，無法校正。"
+			% display_confidence_threshold(args)
+		)
+	if image_width is None:
+		image_width = samples[-1]["image_size"][0]
+
+	calibration = solve_calibration(samples, image_width, source_name)
+	report_calibration(calibration, args, frames_read)
+
+
+def run_image_calibration(args):
+	"""單張參考圖的校正：整段流程只有一格取樣。"""
+	if args.mask is not None:
+		raise RuntimeError(
+			"--calibrate 需要原始影像才能量出瞄準點，不支援 --mask。"
+		)
+
+	args.alignment = AxisAlignment()
+	image = load_image(args.image)
+	outcome = process_frame(image, args, None, False)
+	if outcome is None:
+		raise RuntimeError("參考圖上找不到可用的目標，無法校正。")
+
+	payload = outcome["payload"]
+	threshold = display_confidence_threshold(args)
+	if payload["confidence"] < threshold:
+		raise RuntimeError(
+			"參考圖的可信度只有 %.2f，未達 %.2f，不足以定義瞄準軸。"
+			% (payload["confidence"], threshold)
+		)
+
+	calibration = solve_calibration([payload], image.shape[1], str(args.image))
+	report_calibration(calibration, args, 1)
 
 
 def parse_args():
@@ -1395,18 +1835,86 @@ def parse_args():
 		metavar=("H", "S", "V"),
 		help="HSV 上界",
 	)
+	# 以下四個安裝偏差參數的預設值都是 None，用來區分「沒指定」與
+	# 「指定成預設值」：沒指定才會退回校正檔，指定了就一律優先。
 	parser.add_argument(
 		"--robot-angle",
 		type=float,
-		default=DEFAULT_ROBOT_ANGLE,
-		help="機器人前進方向在影像座標中的角度",
+		default=None,
+		help="機器人前進方向在影像座標中的角度（預設 %g）"
+		% DEFAULT_ROBOT_ANGLE,
+	)
+	parser.add_argument(
+		"--axis-offset-m",
+		type=float,
+		default=None,
+		help="相機相對機器人瞄準軸的側偏（公尺，正為右）；有深度時使用",
+	)
+	parser.add_argument(
+		"--axis-offset-ratio",
+		type=float,
+		default=None,
+		help="同上，但以半畫面寬為單位；沒有深度時使用，只在校正距離上準確",
+	)
+	parser.add_argument(
+		"--axis-yaw-deg",
+		type=float,
+		default=None,
+		help="相機的偏航（度，正為朝右）",
+	)
+	parser.add_argument(
+		"--calibration",
+		default=None,
+		help="讀入 --calibrate 產生的校正檔；個別參數若明確指定則優先",
+	)
+	parser.add_argument(
+		"--calibrate",
+		default=None,
+		help="進入校正模式：把目前輸入來源量到的安裝偏差寫到這個路徑",
+	)
+	parser.add_argument(
+		"--calibrate-seconds",
+		type=float,
+		default=DEFAULT_CALIBRATION_SECONDS,
+		help="影片來源取最後幾秒作為正確姿態",
+	)
+	parser.add_argument(
+		"--calibrate-frames",
+		type=int,
+		default=DEFAULT_CALIBRATION_FRAMES,
+		help="即時來源要收集幾格可用影格",
 	)
 	args = parser.parse_args()
 	if args.min_confidence is None:
 		# 機器運行模式的錯誤會直接變成錯誤的動作，預設就要過濾；
 		# 其他模式維持原本不過濾的行為，以免影響既有用法。
 		args.min_confidence = DEFAULT_MIN_CONFIDENCE if args.robot else 0.0
+	args.alignment = resolve_alignment(args)
 	return args
+
+
+def resolve_alignment(args):
+	"""決定這次要用的安裝偏差：命令列 > 校正檔 > 預設值。"""
+	stored = {}
+	if args.calibration is not None:
+		stored = load_calibration(args.calibration)
+
+	def pick(explicit, key, fallback):
+		if explicit is not None:
+			return explicit
+		return stored.get(key, fallback)
+
+	return AxisAlignment(
+		robot_angle=pick(args.robot_angle, "robot_angle", DEFAULT_ROBOT_ANGLE),
+		offset_m=pick(args.axis_offset_m, "axis_offset_m", DEFAULT_AXIS_OFFSET_M),
+		offset_ratio=pick(
+			args.axis_offset_ratio,
+			"axis_offset_ratio",
+			DEFAULT_AXIS_OFFSET_RATIO,
+		),
+		yaw_deg=pick(args.axis_yaw_deg, "axis_yaw_deg", DEFAULT_AXIS_YAW_DEG),
+		image_width=stored.get("image_width"),
+	)
 
 
 def main():
@@ -1418,6 +1926,10 @@ def main():
 		args.no_display = True
 		args.no_save = True
 
+	if not args.alignment.is_default() and not args.calibrate:
+		# 走 stderr，才不會混進 --robot / --emit-json 的 JSON Lines。
+		print("安裝偏差: %s" % args.alignment.describe(), file=sys.stderr)
+
 	if args.realsense:
 		width, height = args.realsense_size
 		# RealSense 的 pipeline 本身就只保留最新的 frameset，不需要再包一層
@@ -1425,6 +1937,9 @@ def main():
 		capture = RealSenseCapture(
 			width, height, args.realsense_fps, not args.no_realsense_depth
 		)
+		if args.calibrate:
+			run_calibration(capture, args, "realsense", live=True)
+			return
 		if args.output == DEFAULT_IMAGE_OUTPUT:
 			args.output = DEFAULT_VIDEO_OUTPUT
 		run_on_stream(capture, args)
@@ -1436,6 +1951,14 @@ def main():
 		if not capture.isOpened():
 			raise RuntimeError(f"無法開啟輸入來源: {source}")
 
+		if args.calibrate:
+			# 校正不丟格：影片要精準取到最後那段視窗，相機則寧可等
+			# 也不要漏掉可用的影格。
+			run_calibration(
+				capture, args, str(source), live=args.camera is not None
+			)
+			return
+
 		# 相機是即時來源，可以丟格；影片檔必須逐格處理。
 		if args.camera is not None:
 			capture = wrap_live_capture(capture, args)
@@ -1444,6 +1967,10 @@ def main():
 			args.output = DEFAULT_VIDEO_OUTPUT
 
 		run_on_stream(capture, args)
+		return
+
+	if args.calibrate:
+		run_image_calibration(args)
 		return
 
 	mask = build_input_mask(args)
@@ -1465,7 +1992,7 @@ def main():
 	result = apply_angle_filter(result, angle_filter)
 
 	errors = calculate_control_errors(
-		result, mask.shape[1], args.robot_angle
+		result, mask.shape[1], args.alignment
 	)
 	visualization = make_visualization(
 		mask,
