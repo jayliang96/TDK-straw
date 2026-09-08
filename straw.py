@@ -699,11 +699,18 @@ class AxisAlignment:
 		offset_ratio=DEFAULT_AXIS_OFFSET_RATIO,
 		yaw_deg=DEFAULT_AXIS_YAW_DEG,
 		image_width=None,
+		aim_center_px=None,
 	):
 		self.robot_angle = float(robot_angle)
 		self.offset_m = float(offset_m)
 		self.offset_ratio = float(offset_ratio)
 		self.yaw_deg = float(yaw_deg)
+		# 校正時目標中心的像素座標。瞄準軸通過這一點，有了它才能把
+		# 瞄準軸畫成正確的斜線，並在目標上下移動時算對橫向誤差。
+		self.aim_center_px = (
+			None if aim_center_px is None
+			else (float(aim_center_px[0]), float(aim_center_px[1]))
+		)
 		# 校正時的畫面寬度，用來擋下「換了解析度卻沿用同一個 ratio」。
 		self.image_width = (
 			int(image_width) if image_width is not None else None
@@ -717,16 +724,42 @@ class AxisAlignment:
 			x_metres * np.cos(yaw) + z_metres * np.sin(yaw) + self.offset_m
 		)
 
-	def aim_x(self, image_width):
-		"""瞄準軸在畫面上的像素橫座標；偏差為零時就是畫面中線。
+	def aim_slope(self):
+		"""瞄準軸在畫面上的斜率 dx/dy；垂直時為 0。
+
+		瞄準軸是一條與機器人前進方向平行的 3D 直線，投影到畫面上會朝
+		該方向的消失點收斂，因此**不是垂直線**。它的影像角度就是
+		robot_angle：正確姿態下稻草捆的長軸與瞄準軸重合，而校正量到的
+		正是那個角度。
+
+		只有校正過（知道瞄準軸通過哪一點）才套用斜率。沒有校正時
+		robot_angle 只是角度參考，瞄準軸的位置無從確定，維持垂直線。
+		"""
+		if self.aim_center_px is None:
+			return 0.0
+		radians = np.deg2rad(self.robot_angle)
+		sine = np.sin(radians)
+		if abs(sine) < 1e-6:
+			# 瞄準軸在畫面上呈水平，此時橫向誤差沒有意義，不做傾斜。
+			return 0.0
+		return float(np.cos(radians) / sine)
+
+	def aim_x(self, image_width, center_y=None):
+		"""瞄準軸在畫面高度 center_y 處的像素橫座標。
 
 		基準刻意維持畫面中線而非光心 cx：校正量到的是「瞄準點在哪」，
 		光心偏移已經含在裡面，換基準不會改變結果，反而會讓沒有內參的
 		來源（影片、一般相機）與 RealSense 用不同基準。
+
+		目標在畫面上下移動時，瞄準軸的橫座標會跟著斜率移動；拿一條
+		垂直線去量會有 Δy·斜率 的偏差（84.85 度時每 200 px 差 18 px）。
 		"""
 		self.check_image_width(image_width)
 		half_width = image_width / 2.0
-		return half_width + self.offset_ratio * half_width
+		base_x = half_width + self.offset_ratio * half_width
+		if self.aim_center_px is None or center_y is None:
+			return base_x
+		return base_x + (float(center_y) - self.aim_center_px[1]) * self.aim_slope()
 
 	def check_image_width(self, image_width):
 		"""換了解析度卻沿用同一個 offset_ratio 時警告一次。
@@ -863,13 +896,15 @@ def calculate_control_errors(result, image_width, alignment=None):
 		result["angle"], alignment.robot_angle
 	)
 	half_width = image_width / 2.0
-	aim_x = alignment.aim_x(image_width)
+	# 瞄準軸是斜的，要在目標所在的高度上量，不是量到一條垂直線的距離。
+	aim_x = alignment.aim_x(image_width, result["center"][1])
 	lateral_error = float(result["center"][0]) - aim_x
 	return {
 		"heading_error": float(heading_error),
 		"lateral_error": lateral_error,
 		"lateral_error_ratio": lateral_error / half_width,
 		"aim_x": aim_x,
+		"aim_slope": alignment.aim_slope(),
 	}
 
 
@@ -965,29 +1000,37 @@ def make_visualization(
 				tipLength=0.35,
 			)
 
-	# 綠色垂直線是機器人瞄準軸，橫線標出目標中心離它多遠。
-	# 相機不在中軸線上時瞄準軸會離開畫面中線，此時另外用細灰線標出
-	# 畫面中線，才看得出補償了多少。
-	aim_x = int(round(errors.get("aim_x", visualization.shape[1] / 2.0)))
-	middle_x = visualization.shape[1] // 2
-	if aim_x != middle_x:
+	# 綠線是機器人瞄準軸，橫線標出目標中心離它多遠。
+	# 瞄準軸與機器人前進方向平行，投影到畫面上會朝消失點收斂，因此是
+	# 斜的而非垂直 —— 校正過後才知道它通過哪一點，未校正時斜率為 0。
+	# 相機不在中軸線上時瞄準軸會離開畫面中線，另外用細灰線標出畫面
+	# 中線，才看得出補償了多少。
+	height, width = visualization.shape[:2]
+	aim_x = errors.get("aim_x", width / 2.0)
+	aim_slope = errors.get("aim_slope", 0.0)
+	middle_x = width // 2
+	if int(round(aim_x)) != middle_x or aim_slope:
 		cv2.line(
 			visualization,
 			(middle_x, 0),
-			(middle_x, visualization.shape[0]),
+			(middle_x, height),
 			(120, 120, 120),
 			1,
 		)
+	# 瞄準軸通過 (aim_x, 目標中心高度)，依斜率延伸到畫面上下緣。
+	top_x = aim_x + (0 - center[1]) * aim_slope
+	bottom_x = aim_x + (height - center[1]) * aim_slope
 	cv2.line(
 		visualization,
-		(aim_x, 0),
-		(aim_x, visualization.shape[0]),
+		(int(round(top_x)), 0),
+		(int(round(bottom_x)), height),
 		(0, 255, 0),
 		2,
+		lineType=cv2.LINE_AA,
 	)
 	cv2.line(
 		visualization,
-		(aim_x, center[1]),
+		(int(round(aim_x)), center[1]),
 		(center[0], center[1]),
 		(0, 255, 0),
 		4,
@@ -1525,6 +1568,12 @@ def solve_calibration(samples, image_width, source_name):
 		for sample in samples
 	]
 	offset_ratio = float(np.median(ratios))
+	# 瞄準軸通過校正時的目標中心。存下這一點，執行時才能把瞄準軸擺成
+	# 正確的斜線，並在目標上下移動時算對橫向誤差。
+	aim_center = [
+		round(float(np.median([s["center_px"][0] for s in samples])), 1),
+		round(float(np.median([s["center_px"][1] for s in samples])), 1),
+	]
 
 	# 有深度的取樣才能定出與距離無關的公尺側偏。兩個 offset 取自同一批
 	# 影格，因此在校正距離上必定一致，深度掉格時控制端在
@@ -1550,6 +1599,7 @@ def solve_calibration(samples, image_width, source_name):
 		"robot_angle": round(robot_angle, 3),
 		"axis_offset_m": round(offset_m, 4),
 		"axis_offset_ratio": round(offset_ratio, 5),
+		"aim_center_px": aim_center,
 		# yaw 不由單一姿態決定：它與側偏在單一距離上完全簡併。要補的話
 		# 在兩個距離各量一次 lateral_error_m，斜率就是 tan(yaw)。
 		"axis_yaw_deg": DEFAULT_AXIS_YAW_DEG,
@@ -1933,6 +1983,7 @@ def resolve_alignment(args):
 		),
 		yaw_deg=pick(args.axis_yaw_deg, "axis_yaw_deg", DEFAULT_AXIS_YAW_DEG),
 		image_width=stored.get("image_width"),
+		aim_center_px=stored.get("aim_center_px"),
 	)
 
 
