@@ -31,6 +31,9 @@ DEFAULT_SEED_REFINE_STEPS = 4
 DEFAULT_SEED_CONVERGED_DEGREES = 2.0
 # 候選要與最佳解相差這麼多度，才算「另一種解讀」而構成 90 度翻轉的疑慮。
 DEFAULT_SEED_RIVAL_MIN_ANGLE = 20.0
+# 競爭者的側邊還要有最佳解的這個比例長。長方形的兩個方向都有直邊，
+# 但側邊明顯較短的那個描述的是短軸，不是長軸的另一種解讀。
+DEFAULT_SEED_RIVAL_MIN_LENGTH = 0.7
 # 影像座標中畫面的縱向為 90 度。機器人對準稻草捆長軸時，
 # 目標軸線應與畫面縱向重合，此時角度誤差為 0。
 DEFAULT_ROBOT_ANGLE = 90.0
@@ -433,6 +436,11 @@ def fit_side_edges(
 	}
 
 
+def mean_side_length(side_edges):
+	"""兩條側邊的平均長度，用來分辨長軸與短軸。"""
+	return (side_edges["left_length"] + side_edges["right_length"]) / 2.0
+
+
 def side_straightness(side_edges):
 	"""兩條側邊中較差的那條的直線段佔比。
 
@@ -594,15 +602,21 @@ def analyze_target(target_mask):
 
 	candidates.sort(key=lambda item: item[0], reverse=True)
 	best_score, side_edges = candidates[0]
-	# 只有指向不同軸線的候選才算競爭者。兩個種子收斂到同一個方向代表
-	# 彼此印證，是最可靠的情況，不該被當成模稜兩可。
+	# 只有指向不同軸線、且側邊長度相當的候選才算競爭者。
+	# 兩個種子收斂到同一個方向代表彼此印證，是最可靠的情況；而側邊
+	# 明顯較短的候選描述的是短軸 —— 長方形的兩個方向都有直邊，若不看
+	# 長度，短軸會一直被誤判成勢均力敵的對手而無謂地壓低可信度。
+	best_length = mean_side_length(side_edges)
 	rival_score = 0.0
 	for score, fitted in candidates[1:]:
 		if (
 			axis_angle_difference(fitted["angle"], side_edges["angle"])
-			> DEFAULT_SEED_RIVAL_MIN_ANGLE
+			<= DEFAULT_SEED_RIVAL_MIN_ANGLE
 		):
-			rival_score = max(rival_score, score)
+			continue
+		if mean_side_length(fitted) < best_length * DEFAULT_SEED_RIVAL_MIN_LENGTH:
+			continue
+		rival_score = max(rival_score, score)
 	seed_margin = (
 		(best_score - rival_score) / best_score if best_score > 1e-6 else 0.0
 	)

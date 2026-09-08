@@ -13,10 +13,15 @@ frames_queue_size（rs.pipeline 本身只保留最新的 frameset，改成 1 對
 
 RGB 的 auto_exposure_priority 預設開啟，光線一暗驅動會自己把彩色降到
 6~15 fps 來換曝光時間，看起來也像卡頓，這裡關掉；此次未在暗處實測。
+
+--record 會把這次串流錄下來當測試素材。副檔名決定錄什麼：.mp4/.avi 只
+錄彩色（可直接餵給 straw.py --video），.bag 是 SDK 原生格式，彩色與深度
+都留得住，但一分鐘就好幾百 MB。
 """
 
 import argparse
 import time
+from pathlib import Path
 
 import numpy as np
 import cv2
@@ -30,6 +35,9 @@ STREAM_CANDIDATES = [
     ("424x240@30 彩色 + 480x270@30 深度", (424, 240, 30), (480, 270, 30)),
     ("640x480@30 僅彩色", (640, 480, 30), None),
 ]
+
+# 錄影支援的副檔名。.bag 交給 SDK 錄，其餘走 cv2.VideoWriter。
+RECORD_SUFFIXES = (".mp4", ".avi", ".bag")
 
 
 def describe_device():
@@ -80,7 +88,7 @@ def tune_sensors(profile, keep_fps):
             sensor.set_option(rs.option.auto_exposure_priority, 0)
 
 
-def start_stream(color, depth, keep_fps, probe_ms=2000):
+def start_stream(color, depth, keep_fps, record_bag=None, probe_ms=2000):
     """啟動串流，並確認真的收得到影格。
 
     在 USB 2.x 上 pipeline.start() 會成功、wait_for_frames() 卻永遠等不到
@@ -93,6 +101,10 @@ def start_stream(color, depth, keep_fps, probe_ms=2000):
     if depth:
         config.enable_stream(rs.stream.depth, depth[0], depth[1],
                              rs.format.z16, depth[2])
+    if record_bag is not None:
+        # 錄 bag 由 SDK 在 pipeline 內部完成，必須在 start() 之前掛上；
+        # 寫進檔案的是原始影格，不受下面的上色與時間濾波影響。
+        config.enable_record_to_file(str(record_bag))
 
     profile = pipeline.start(config)
     tune_sensors(profile, keep_fps)
@@ -104,8 +116,12 @@ def start_stream(color, depth, keep_fps, probe_ms=2000):
     return pipeline
 
 
-def open_camera(args):
-    """依序嘗試候選組合，回傳第一個真的出得了格的串流。"""
+def open_camera(args, record_bag=None):
+    """依序嘗試候選組合，回傳第一個真的出得了格的串流。
+
+    一併回傳選中的彩色規格：錄影要用實際談成的解析度與影格率開檔，退到
+    後備組合時若還照 640x480@30 開，寫出來的檔案是壞的。
+    """
     candidates = STREAM_CANDIDATES
     if args.no_depth:
         candidates = [(label, color, None) for label, color, _ in candidates]
@@ -113,16 +129,34 @@ def open_camera(args):
     for label, color, depth in candidates:
         try:
             pipeline = start_stream(
-                color, depth, not args.keep_auto_exposure_priority)
+                color, depth, not args.keep_auto_exposure_priority, record_bag)
         except RuntimeError as error:
             print("  %s：不可用(%s)" % (label, error))
             continue
         print("  %s：可用" % label)
-        return pipeline, label
+        return pipeline, label, color
     raise RuntimeError(
         "所有組合都拿不到影格。請重新插拔相機，並確認沒有其他程式"
         "(straw.py 或另一個 realsense_test.py)正佔用它。"
     )
+
+
+def open_recorder(record_path, color):
+    """開好彩色影片的寫檔器；.bag 由 SDK 自己錄，不走這裡。
+
+    影格率用相機談成的值，不用畫面上那個實測值 —— 實測值要跑滿一秒才有，
+    開檔的當下還沒有。代價是掉格時錄出來的片長會比實際短，掉了多少畫面
+    上的 dropped 有寫。
+    """
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(
+        str(record_path), fourcc, float(color[2]), (color[0], color[1])
+    )
+    if not writer.isOpened():
+        raise RuntimeError("無法開啟 %s 寫檔，請確認路徑存在且副檔名支援。"
+                           % record_path)
+    return writer
 
 
 def main():
@@ -136,9 +170,25 @@ def main():
                         help="深度上色的工作距離，單位公尺，預設 0.2 2.0")
     parser.add_argument("--no-temporal-filter", action="store_true",
                         help="關掉時間濾波，可以看到未經平滑的原始雜點")
+    parser.add_argument("--record", metavar="PATH",
+                        help="把這次串流錄下來；.mp4/.avi 只錄彩色，"
+                             "可直接餵給 straw.py --video，.bag 連深度一起"
+                             "錄但檔案大得多")
     args = parser.parse_args()
 
     near_mm, far_mm = (round(v * 1000.0) for v in args.depth_range)
+
+    record_path = Path(args.record) if args.record else None
+    record_bag = None
+    if record_path is not None:
+        suffix = record_path.suffix.lower()
+        if suffix not in RECORD_SUFFIXES:
+            parser.error("--record 的副檔名只能是 %s，收到 %r。"
+                         % ("/".join(RECORD_SUFFIXES), record_path.suffix))
+        if suffix == ".bag":
+            # bag 要在 pipeline 起來之前就掛上，不能等拿到影格才決定。
+            record_bag = record_path
+            record_path.parent.mkdir(parents=True, exist_ok=True)
 
     usb, message = describe_device()
     print(message)
@@ -146,9 +196,16 @@ def main():
         return
 
     print("尋找可用的串流組合：")
-    pipeline, label = open_camera(args)
+    pipeline, label, color = open_camera(args, record_bag)
     print("使用 %s，ESC 離開。" % label)
     print("深度上色範圍 %d~%dmm，黑色代表沒有深度資料。" % (near_mm, far_mm))
+
+    writer = None
+    if record_path is not None and record_bag is None:
+        writer = open_recorder(record_path, color)
+    if record_path is not None:
+        print("錄影中：%s（%s）。按 ESC 停止並收檔。"
+              % (record_path, "彩色+深度 bag" if record_bag else "彩色影片"))
 
     # 時間濾波拿前幾格做加權，實測可以把破洞從 22.4% 降到 21.0%、有效值的
     # 逐格抖動壓掉約 1.6mm。它擋不掉邊緣的假距離(紅點)：預設 delta 是 20mm，
@@ -167,6 +224,8 @@ def main():
     fps = 0.0
     dropped = 0
     previous_number = None
+    recorded = 0
+    record_start = time.perf_counter()
 
     try:
         while True:
@@ -180,6 +239,13 @@ def main():
                 dropped += number - previous_number - 1
             previous_number = number
             images = np.asanyarray(color_frame.get_data())
+
+            if record_path is not None:
+                recorded += 1
+            if writer is not None:
+                # 存進去的是原始彩色影格：右邊的深度併圖與左上的疊字都是
+                # 給人看的，錄進檔案會讓 straw.py 讀到根本不存在的東西。
+                writer.write(images)
 
             depth_frame = frames.get_depth_frame()
             if depth_frame:
@@ -204,12 +270,29 @@ def main():
                 images, "%.1f fps  dropped %d  USB %s" % (fps, dropped, usb),
                 (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
             )
+            if record_path is not None:
+                cv2.putText(
+                    images,
+                    "REC %.1fs  %d frames"
+                    % (time.perf_counter() - record_start, recorded),
+                    (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
+                )
             cv2.imshow('RealSense D435', images)
             if cv2.waitKey(1) == 27:  # ESC 離開
                 break
     finally:
+        # bag 由 pipeline.stop() 收尾，mp4 由 writer.release() 補完索引；
+        # 少了任何一邊檔案都會是壞的，所以放在 finally 裡。
         pipeline.stop()
+        if writer is not None:
+            writer.release()
         cv2.destroyAllWindows()
+
+    if record_path is not None:
+        size_mb = (record_path.stat().st_size / (1024.0 * 1024.0)
+                   if record_path.exists() else 0.0)
+        print("錄影已儲存：%s（%d 格，%.1f MB，期間掉格 %d）"
+              % (record_path, recorded, size_mb, dropped))
 
 
 if __name__ == "__main__":
