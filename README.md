@@ -288,6 +288,21 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
+### 用 Docker 跑（主機不必裝 ROS2）
+
+主機是 Ubuntu 24.04 也沒關係，Humble 只活在容器裡。`Dockerfile` 會把 `ros2/` 下的兩個 package build 好，`docker-compose.yml` 已設定 `network_mode: host`（主機的 `ros2 topic echo` 看得到容器內的話題）、`privileged` 加掛整個 `/dev`（RealSense 走 USB）、以及 X11 socket（預覽視窗）。
+
+```bash
+docker compose build              # 第一次，或 package.xml / Dockerfile 改過之後
+xhost +local:docker               # 要開預覽視窗才需要，每次開機做一次
+docker compose up -d straw        # 容器常駐
+docker compose exec straw /entrypoint.sh bash   # 每開一個終端就下一次
+```
+
+**進容器一定要經過 `/entrypoint.sh`。** `docker compose exec` 不會走 ENTRYPOINT，直接 `exec straw bash` 進去 `ros2` 會是 `command not found`；`entrypoint.sh` 負責 source `/opt/ros/humble/setup.bash` 與 `/ws/install/setup.bash`。已經進去的 shell 手動 source 這兩個檔也行。
+
+repo 以 bind mount 掛在 `/ws/src/TDK-straw`，跟 build 時同一路徑，`--symlink-install` 之後改 python 檔不必重 build。容器以主機相同的 UID 執行，`output/` 等產生的檔案不會變成 root 擁有。
+
 ### 啟動
 
 ```bash
@@ -347,6 +362,64 @@ ros2 topic echo /straw/target
 **QoS 必須用 sensor data。** RealSense 以 `SensorDataQoS`（best effort）發佈影像；訂閱端若用 rclpy 預設的 reliable QoS，兩邊不相容，會**一則訊息都收不到，而且不會報錯**。本節點已使用 `qos_profile_sensor_data`。
 
 **話題名稱依 realsense-ros 版本而異。** 較新版本是 `/camera/camera/color/image_raw`（兩層 camera 命名空間），舊版是 `/camera/color/image_raw`。先用 `ros2 topic list` 確認，再用 `camera_namespace` 覆寫。
+
+### 測試 RealSense 節點
+
+由淺到深分四關，每一關過了再往下，出問題才知道卡在哪一層。以下指令都在容器內（或裝好 ROS2 的主機）執行。**相機同時只能被一個程式佔用**，每一關開始前要先把上一關的程式關掉。
+
+**第 1 關：不經 ROS，確認硬體出得了格。**
+
+```bash
+python3 realsense_test.py
+```
+
+要看到 `以 USB 3.2 連線`、`1280x720@30 彩色+深度：可用`，視窗左上 `30.0 fps  dropped 0`。印出 `USB 2.x` 就換埠或換線。看完**按 ESC 離開**，不要 Ctrl-C，讓它正常走 `pipeline.stop()`（見下方「Depth stream start failure」）。
+
+**第 2 關：單獨起 realsense node。**
+
+```bash
+ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true rgb_camera.color_profile:=1280x720x30
+```
+
+log 要有 `Device USB type: 3.2`、`Open profile: ... Color ... 1280x720 ... 30`、`RealSense Node Is Up!`。
+
+- `Couldn't resolve requests`：USB 2 模式撐不起 1280x720。
+- `No RealSense devices were found`：第 1 關的程式還開著，或容器沒掛 `/dev`。
+- 啟動後一次 `Hardware Notification: Depth stream start failure`：深度模組卡在上一次沒乾淨收掉的狀態。SDK 通常會自己重試成功，用第 3 關的 `hz` 確認深度有在出即可；沒有的話加 `initial_reset:=true` 重起，再不行就實體重插相機。
+
+**第 3 關：確認話題真的有資料在流。** 另開一個終端：
+
+```bash
+ros2 topic list | grep camera        # 確認命名空間是 /camera/camera 還是 /camera
+ros2 topic hz /camera/camera/color/image_raw
+ros2 topic hz /camera/camera/aligned_depth_to_color/image_raw
+ros2 topic echo /camera/camera/color/camera_info --once
+```
+
+兩個 `hz` 都要穩在約 30 Hz（剛啟動的前幾秒偏低是正常的）。`camera_info` 要是 `width: 1280`、`height: 720`，`k` 的 fx/fy 約 910。
+
+- `aligned_depth_to_color` 不存在：`align_depth.enable` 沒帶到。節點訂的就是這個話題，沒有它會靜默收不到任何東西。
+- 話題列得出來但 `hz` 沒數字：QoS 不合，加 `--qos-reliability best_effort`。
+
+**第 4 關：接上 straw_node 做端到端。** 把第 2 關的 launch 關掉，改用專案的一行 launch：
+
+```bash
+ros2 launch straw_detector straw_with_camera.launch.py publish_annotated:=true
+ros2 topic echo /straw/target          # 另一個終端
+```
+
+鏡頭前放目標物，要看到 `valid: true`、`has_depth: true`、`distance_m` 接近實際距離；拿開後變 `valid: false`、`reason: no_detection`。
+
+- `/straw/target` 一則都沒有：`aligned_depth_to_color` 沒出來（回第 3 關），或 `camera_namespace` 跟實際話題名不符。
+- `valid: true` 但 `has_depth: false`：訊息有發代表彩色與深度都有同步收到，剩下兩種可能——log 沒有 `取得內參 fx=...`（`camera_info` 話題名不對），或目標中心鄰域的深度全是 0。後者最常見的原因是**目標離相機不到 0.3 m**（D435 深度的最短量程），其次是螢幕、照片、光滑反光面或無紋理平面。
+
+**用預覽視窗看深度。** `has_depth` 為什麼是 false 用 CLI 看最快，它與節點共用同一套 `build_depth_fields`，判斷完全一致。先關掉 ROS 端的 launch，再：
+
+```bash
+python3 straw.py --realsense
+```
+
+終端每格印一行，有 `距離: 0.812 m` 就是深度取到了，沒有就是那一塊沒有有效深度；一邊移動目標一邊看距離什麼時候出現，就能分辨是太近還是表面問題。`--emit-json` 改印與 `StrawTarget` 同欄位的 JSON。用 `q` 或 `Esc` 結束，不要 Ctrl-C。
 
 ---
 
@@ -503,5 +576,6 @@ ros2 topic echo /straw/target
 - `ros2/straw_detector/` — ROS2 package：`straw_detector/straw.py`（偵測邏輯與命令列介面的正本）、`straw_detector/detector_node.py`（ROS2 節點）、`launch/`、`config/`（參數 YAML 與校正檔）
 - `ros2/straw_interfaces/` — ROS2 package：`StrawTarget.msg`
 - `realsense_test.py` — 以 pyrealsense2 直連相機的串流測試，用來確認硬體正常；`--record` 可錄下素材
+- `Dockerfile`、`docker-compose.yml`、`docker/entrypoint.sh` — ROS2 Humble 執行環境，主機不必裝 ROS2，見〈用 Docker 跑〉
 - `data/` — 測試素材（影片檔不進版控）
 - `output/` — 程式產生的標註結果，不進版控
