@@ -16,7 +16,7 @@
   <exec_depend>straw_interfaces</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
-  <!-- pyrealsense2 沒有 rosdep key。只有 CLI 的 --realsense 用到，節點本身
+  <!-- pyrealsense2 沒有 rosdep key。只有 CLI 的 realsense 模式用到，節點本身
        吃的是 realsense-ros 發的話題，不需要它；要用 CLI 直連相機請 pip 安裝。 -->
   <exec_depend>realsense2_camera</exec_depend>
   <exec_depend>ros2launch</exec_depend>

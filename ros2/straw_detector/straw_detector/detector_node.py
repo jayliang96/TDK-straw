@@ -18,6 +18,7 @@ from pathlib import Path
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
@@ -203,8 +204,10 @@ class StrawDetectorNode(Node):
 		)
 		self.synchroniser.registerCallback(self.on_color_and_depth)
 
+		# camera_info 也用 sensor data QoS：best effort 的訂閱端與 reliable 或
+		# best effort 的發佈端都相容，不必猜 realsense-ros 這一版怎麼發。
 		self.create_subscription(
-			CameraInfo, info_topic, self.on_camera_info, 10
+			CameraInfo, info_topic, self.on_camera_info, qos_profile_sensor_data
 		)
 		self.get_logger().info(
 			"訂閱彩色 %s 與深度 %s，內參來自 %s"
@@ -228,12 +231,14 @@ class StrawDetectorNode(Node):
 		)
 
 	def on_color_only(self, color_message):
-		self.handle(color_message, None)
+		self.process_messages(color_message, None)
 
 	def on_color_and_depth(self, color_message, depth_message):
-		self.handle(color_message, depth_message)
+		self.process_messages(color_message, depth_message)
 
-	def handle(self, color_message, depth_message):
+	# 不能叫 handle：rclpy 的 Node 有同名 property（底層的 C 節點），
+	# 蓋掉它會讓 Node.__init__ 在 `with self.handle:` 直接炸掉。
+	def process_messages(self, color_message, depth_message):
 		try:
 			frame = self.bridge.imgmsg_to_cv2(
 				color_message, desired_encoding="bgr8"
@@ -340,7 +345,8 @@ def main(args=None):
 	node = StrawDetectorNode()
 	try:
 		rclpy.spin(node)
-	except KeyboardInterrupt:
+	except (KeyboardInterrupt, ExternalShutdownException):
+		# Ctrl-C 或 launch 收掉 context（SIGTERM）都是正常結束，不必印 traceback。
 		pass
 	finally:
 		node.destroy_node()

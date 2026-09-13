@@ -11,3 +11,6 @@ data/*.mp4
 build/
 install/
 log/
+
+# 本機 python venv
+.venv/

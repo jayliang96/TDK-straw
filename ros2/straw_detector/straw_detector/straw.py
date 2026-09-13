@@ -2083,14 +2083,15 @@ def main():
 		display_confidence_threshold(args),
 	)
 
-	save_outputs(
-		args.output,
-		visualization,
-		mask,
-		component["mask"],
-		args.save_masks,
-		args.mask is None,
-	)
+	if not args.no_save:
+		save_outputs(
+			args.output,
+			visualization,
+			mask,
+			component["mask"],
+			args.save_masks,
+			args.mask is None,
+		)
 
 	if args.emit_json:
 		emit_payload(build_robot_payload(result, errors, mask.shape))
@@ -2115,7 +2116,8 @@ def main():
 		f"精度 {terms['precision']:.2f} / 種子 {terms['seed_margin']:.2f}"
 	)
 	print(f"方向可信度: {result['confidence']:.2f}")
-	print(f"標註圖已儲存: {args.output}")
+	if not args.no_save:
+		print(f"標註圖已儲存: {args.output}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,21 @@
+services:
+  straw:
+    build: .
+    image: tdk-straw:humble
+    container_name: tdk-straw
+    # DDS 靠 multicast 找節點，主機端的 ros2 topic echo 要看得到容器內的話題就得共用網路。
+    network_mode: host
+    ipc: host
+    # RealSense 走 USB，realsense-ros 官方建議 privileged 加整個 /dev。
+    privileged: true
+    volumes:
+      - /dev:/dev
+      # 整個 repo 掛到 build 時的同一路徑，symlink-install 才接得上。
+      - .:/ws/src/TDK-straw
+      # 預覽視窗用（--display / publish_annotated），主機先 xhost +local:docker
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    stdin_open: true
+    tty: true

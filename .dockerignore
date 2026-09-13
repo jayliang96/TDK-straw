@@ -1,0 +1,9 @@
+.git
+build/
+install/
+log/
+output/
+data/*.MOV
+data/*.mp4
+__pycache__/
+.venv/
