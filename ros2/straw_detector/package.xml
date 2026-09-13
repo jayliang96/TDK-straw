@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>straw_detector</name>
+  <version>0.1.0</version>
+  <description>從 RealSense 影像偵測稻草捆，發佈機器人對準所需的角度與橫向誤差</description>
+  <maintainer email="qqja3710859@gmail.com">yusheng</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>straw_interfaces</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- pyrealsense2 沒有 rosdep key。只有 CLI 的 --realsense 用到，節點本身
+       吃的是 realsense-ros 發的話題，不需要它；要用 CLI 直連相機請 pip 安裝。 -->
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

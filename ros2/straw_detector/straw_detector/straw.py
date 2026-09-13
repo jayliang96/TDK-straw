@@ -71,6 +71,11 @@ DEFAULT_SEED_MARGIN_TARGET = 0.25
 # 瞄偏一個相機側偏的距離，而畫面看起來完全正常；預設載入才是安全的
 # 那一邊。載入時一律在 stderr 印出實際採用的偏差，不會無聲生效。
 DEFAULT_CALIBRATION_FILE = "axis_calibration.json"
+# 校正檔的正本跟著 package 走（config/），先找執行目錄是為了讓現場
+# 臨時換一份校正時，直接丟在旁邊就能蓋過正本。
+PACKAGE_CALIBRATION_FILE = (
+	Path(__file__).resolve().parent.parent / "config" / DEFAULT_CALIBRATION_FILE
+)
 DEFAULT_IMAGE_OUTPUT = "output/straw_detection.png"
 DEFAULT_VIDEO_OUTPUT = "output/straw_detection.mp4"
 
@@ -1953,18 +1958,24 @@ def parse_args():
 	return args
 
 
+def find_default_calibration():
+	"""依序找執行目錄與 package 內的校正檔，都沒有就回 None。"""
+	for candidate in (Path(DEFAULT_CALIBRATION_FILE), PACKAGE_CALIBRATION_FILE):
+		if candidate.is_file():
+			return candidate
+	return None
+
+
 def resolve_alignment(args):
 	"""決定這次要用的安裝偏差：命令列 > 校正檔 > 預設值。
 
-	沒指定 --calibration 時會自動找 DEFAULT_CALIBRATION_FILE，找不到就
-	維持零偏差。校正模式本身在量絕對值，不套用任何既有校正。
+	沒指定 --calibration 時會自動找校正檔（見 find_default_calibration），
+	找不到就維持零偏差。校正模式本身在量絕對值，不套用任何既有校正。
 	"""
 	stored = {}
 	path = args.calibration
 	if path is None and not args.no_calibration and not args.calibrate:
-		default_path = Path(DEFAULT_CALIBRATION_FILE)
-		if default_path.is_file():
-			path = default_path
+		path = find_default_calibration()
 	if path is not None:
 		stored = load_calibration(path)
 

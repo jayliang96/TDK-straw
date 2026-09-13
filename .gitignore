@@ -6,3 +6,8 @@ output/
 # 測試影片過大（十幾 MB 到數十 MB），請自行放到 data/
 data/*.MOV
 data/*.mp4
+
+# colcon 在 repo 內 build 時的產物
+build/
+install/
+log/

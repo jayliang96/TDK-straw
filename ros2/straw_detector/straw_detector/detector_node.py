@@ -2,36 +2,42 @@
 
 偵測邏輯全部沿用 straw.py，本檔只負責 ROS2 的收發、參數與深度換算。
 
-訊息格式為 std_msgs/String 承載 JSON，與 `straw.py --emit-json` 的內容
-相同，另外多了取自影像 header 的時間戳。選 String 而非自訂訊息是為了
-免去 colcon build；若要型別安全的版本，把 publish_payload 換成自訂 .msg
-即可，其餘邏輯不必動。
+訊息為 straw_interfaces/StrawTarget，欄位與 `straw.py --emit-json` 的
+JSON 一一對應，header 沿用來源影像的 header 供控制端對時。
 
 啟用深度後會多出目標中心的相機座標（公尺），控制端就不必自己處理
 「同樣的像素偏移在不同距離代表不同實際偏移」這件事。
 
-用法：
-    python straw_ros2_node.py --ros-args \
-        -p image_topic:=/camera/camera/color/image_raw \
-        -p use_depth:=true
+參數集中在 config/straw_detector.yaml，用 launch 檔啟動：
+    ros2 launch straw_detector straw_detector.launch.py
 """
 
-import json
+import math
+from pathlib import Path
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from straw_interfaces.msg import StrawTarget
 
-from straw import (DEFAULT_AXIS_OFFSET_M, DEFAULT_AXIS_OFFSET_RATIO,
-                   DEFAULT_AXIS_YAW_DEG, DEFAULT_DEPTH_PATCH_RADIUS,
-                   DEFAULT_DEPTH_SCALE, DEFAULT_FILTER_ALPHA,
-                   DEFAULT_LOWER_HSV, DEFAULT_MIN_AREA, DEFAULT_MIN_CONFIDENCE,
-                   DEFAULT_MORPHOLOGY_KERNEL, DEFAULT_ROBOT_ANGLE,
-                   DEFAULT_UPPER_HSV, AxisAlignment, AxisAngleFilter,
-                   build_depth_fields, load_calibration, process_frame)
+from .straw import (DEFAULT_CALIBRATION_FILE, DEFAULT_DEPTH_PATCH_RADIUS,
+                    DEFAULT_DEPTH_SCALE, DEFAULT_FILTER_ALPHA,
+                    DEFAULT_LOWER_HSV, DEFAULT_MIN_AREA,
+                    DEFAULT_MIN_CONFIDENCE, DEFAULT_MORPHOLOGY_KERNEL,
+                    DEFAULT_UPPER_HSV, AxisAlignment, AxisAngleFilter,
+                    build_depth_fields, load_calibration, process_frame)
+
+# 安裝偏差的參數名對應到 AxisAlignment 建構子的關鍵字。這四個參數沒設時
+# 用 NaN 當哨兵，才分得出「沒設」與「設成剛好等於預設」。
+ALIGNMENT_PARAMETERS = {
+	"robot_angle": "robot_angle",
+	"axis_offset_m": "offset_m",
+	"axis_offset_ratio": "offset_ratio",
+	"axis_yaw_deg": "yaw_deg",
+}
 
 
 class DetectionSettings:
@@ -49,33 +55,52 @@ class DetectionSettings:
 		)
 
 
+def find_calibration_file(node):
+	"""決定要載入的校正檔：參數指定 > package 的 config/ > 不載入。
+
+	與 straw.py 相同，預設載入才是安全的那一邊：機器上忘記帶參數會讓
+	機器人瞄偏一個相機側偏的距離，而畫面看起來完全正常。
+	"""
+	if not node.get_parameter("use_calibration").value:
+		return None
+	explicit = node.get_parameter("calibration_file").value
+	if explicit:
+		return Path(explicit)
+	default = (
+		Path(get_package_share_directory("straw_detector"))
+		/ "config" / DEFAULT_CALIBRATION_FILE
+	)
+	return default if default.is_file() else None
+
+
 def build_alignment(node):
 	"""組出相機的安裝偏差：參數 > 校正檔 > 預設值。
 
-	參數的預設值刻意等於 straw.py 的預設值，因此「參數沒被覆寫」與
-	「參數被設成預設值」無法區分；校正檔要生效就別去動這幾個參數。
+	參數宣告時預設為 NaN，只有 YAML 或命令列真的給了值才會蓋過校正檔。
+	校正檔的 image_width 與 aim_center_px 也一併傳入，瞄準軸才能依透視
+	畫成斜線並在目標所在高度上量橫向誤差。
 	"""
 	stored = {}
-	calibration_file = node.get_parameter("calibration_file").value
-	if calibration_file:
+	calibration_file = find_calibration_file(node)
+	if calibration_file is not None:
 		stored = load_calibration(calibration_file)
 		node.get_logger().info("讀入校正檔: %s" % calibration_file)
+	else:
+		node.get_logger().warn("未載入校正檔，安裝偏差視為零")
 
-	def pick(name, key, fallback):
+	# 缺的鍵不傳，交給 AxisAlignment 的預設值處理。
+	kwargs = {}
+	for name, keyword in ALIGNMENT_PARAMETERS.items():
 		value = float(node.get_parameter(name).value)
-		if value != fallback:
-			return value
-		return float(stored.get(key, fallback))
+		if math.isnan(value):
+			value = stored.get(name)
+		if value is not None:
+			kwargs[keyword] = value
 
 	alignment = AxisAlignment(
-		robot_angle=pick("robot_angle", "robot_angle", DEFAULT_ROBOT_ANGLE),
-		offset_m=pick("axis_offset_m", "axis_offset_m", DEFAULT_AXIS_OFFSET_M),
-		offset_ratio=pick(
-			"axis_offset_ratio",
-			"axis_offset_ratio",
-			DEFAULT_AXIS_OFFSET_RATIO,
-		),
-		yaw_deg=pick("axis_yaw_deg", "axis_yaw_deg", DEFAULT_AXIS_YAW_DEG),
+		image_width=stored.get("image_width"),
+		aim_center_px=stored.get("aim_center_px"),
+		**kwargs,
 	)
 	node.get_logger().info("安裝偏差: %s" % alignment.describe())
 	return alignment
@@ -112,10 +137,10 @@ class StrawDetectorNode(Node):
 		self.declare_parameter("upper_hsv", list(DEFAULT_UPPER_HSV))
 		self.declare_parameter("kernel_size", DEFAULT_MORPHOLOGY_KERNEL)
 		self.declare_parameter("min_area", DEFAULT_MIN_AREA)
-		self.declare_parameter("robot_angle", DEFAULT_ROBOT_ANGLE)
-		self.declare_parameter("axis_offset_m", DEFAULT_AXIS_OFFSET_M)
-		self.declare_parameter("axis_offset_ratio", DEFAULT_AXIS_OFFSET_RATIO)
-		self.declare_parameter("axis_yaw_deg", DEFAULT_AXIS_YAW_DEG)
+		for name in ALIGNMENT_PARAMETERS:
+			self.declare_parameter(name, float("nan"))
+		self.declare_parameter("use_calibration", True)
+		# 空字串代表用 package 內 config/ 的校正檔。
 		self.declare_parameter("calibration_file", "")
 
 		self.settings = DetectionSettings(self)
@@ -138,7 +163,7 @@ class StrawDetectorNode(Node):
 		self.intrinsics = None
 
 		self.target_publisher = self.create_publisher(
-			String, self.get_parameter("target_topic").value, 10
+			StrawTarget, self.get_parameter("target_topic").value, 10
 		)
 		self.annotated_publisher = None
 		if self.publish_annotated:
@@ -222,7 +247,9 @@ class StrawDetectorNode(Node):
 			frame, self.settings, self.angle_filter, self.publish_annotated
 		)
 		if outcome is None:
-			self.publish_payload({"valid": False}, color_message)
+			self.publish_payload(
+				{"valid": False, "reason": "no_detection"}, color_message
+			)
 			return
 
 		payload = outcome["payload"]
@@ -278,13 +305,34 @@ class StrawDetectorNode(Node):
 		)
 
 	def publish_payload(self, payload, source_message):
-		"""發佈一筆結果，時間戳沿用來源影像，供控制端對時。"""
-		payload = dict(payload)
-		payload["stamp_sec"] = int(source_message.header.stamp.sec)
-		payload["stamp_nanosec"] = int(source_message.header.stamp.nanosec)
-		self.target_publisher.publish(
-			String(data=json.dumps(payload, ensure_ascii=False))
-		)
+		"""把 straw.py 的 payload dict 攤成 StrawTarget 發佈。
+
+		header 沿用來源影像的，供控制端對時。dict 裡沒有的欄位維持 msg
+		的零值；valid=false 時 reason 說明是沒偵測到還是可信度不足。
+		"""
+		message = StrawTarget()
+		message.header = source_message.header
+		message.valid = bool(payload.get("valid", False))
+		message.reason = str(payload.get("reason", ""))
+		message.confidence = float(payload.get("confidence", 0.0))
+		if message.valid:
+			message.heading_error_deg = float(payload["heading_error_deg"])
+			message.lateral_error_px = float(payload["lateral_error_px"])
+			message.lateral_error_ratio = float(payload["lateral_error_ratio"])
+			message.angle_deg = float(payload["angle_deg"])
+			message.angle_sigma_deg = float(payload["angle_sigma_deg"])
+			message.center_px = [float(v) for v in payload["center_px"]]
+			message.image_size = [int(v) for v in payload["image_size"]]
+		message.has_depth = bool(payload.get("has_depth", False))
+		if message.has_depth:
+			message.distance_m = float(payload["distance_m"])
+			message.lateral_error_m = float(payload["lateral_error_m"])
+			message.camera_lateral_m = float(payload["camera_lateral_m"])
+			x, y, z = payload["position_m"]
+			message.position_m.x = float(x)
+			message.position_m.y = float(y)
+			message.position_m.z = float(z)
+		self.target_publisher.publish(message)
 
 
 def main(args=None):

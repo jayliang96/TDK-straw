@@ -15,7 +15,7 @@ pip install opencv-python numpy
 | 情境 | 額外相依 |
 |---|---|
 | `--realsense`（直連 RealSense） | `pyrealsense2` |
-| `straw_ros2_node.py`（ROS2 節點） | `rclpy`、`cv_bridge`、`message_filters`（ROS2 桌面版已包含） |
+| ROS2 節點（`ros2/` 下的 package） | ROS2 Humble 桌面版、`ros-humble-realsense2-camera`，見〈ROS2 package〉 |
 
 ## 快速開始
 
@@ -226,7 +226,7 @@ python straw.py --image data/aligned.jpg --calibrate axis_calibration.json
 python straw.py --realsense --robot
 ```
 
-**校正檔預設會自動載入**（`axis_calibration.json`，放在執行目錄下即可）。在機器上忘記帶參數會讓機器人瞄偏一個相機側偏的距離，而畫面看起來完全正常，所以預設載入才是安全的那一邊；載入時一律在 stderr 印出實際採用的偏差。`--calibration` 換檔案，`--no-calibration` 關掉。ROS2 節點沒有這個預設（工作目錄不定），要用 `calibration_file` 明確指定。
+**校正檔預設會自動載入**。正本在 `ros2/straw_detector/config/axis_calibration.json`，跟著 package 走；執行目錄下若另有一份 `axis_calibration.json` 會優先採用，現場要臨時換校正直接丟在旁邊就好。在機器上忘記帶參數會讓機器人瞄偏一個相機側偏的距離，而畫面看起來完全正常，所以預設載入才是安全的那一邊；載入時一律在 stderr 印出實際採用的偏差。`--calibration` 換檔案，`--no-calibration` 關掉。ROS2 節點同樣預設載入 package 內的正本，用 `calibration_file` 換檔案、`use_calibration:=false` 關掉。
 
 這比量測相機的安裝位置好，不只是省事：它一次吸收 roll、偏航、鏡頭畸變、光心偏移，以及**夾爪相對機器人中心的偏移**。真正要問的問題不是「機器人中軸線在哪」，而是「稻草捆要出現在哪，夾爪才夾得到」—— 後者拿尺量不出來。量出來的參數仍是人看得懂的純文字，可以拿捲尺粗略核對，也可以手動編輯。
 
@@ -267,26 +267,67 @@ RealSense 現場實測（1280x720，30 格全部可用）：軸線角度散佈 0
 
 ---
 
-## ROS2 節點
+## ROS2 package
 
-`straw_ros2_node.py` 訂閱 RealSense 的彩色與深度話題，發佈對準誤差。偵測邏輯直接沿用 `straw.py`，本檔只負責 ROS2 的收發與深度換算。
+`ros2/` 底下是兩個 ROS2 package（Humble）：
+
+- `straw_detector`（ament_python）— `straw.py` 的正本住在這裡，加上 ROS2 節點 `detector_node.py`、launch 檔、參數 YAML 與校正檔。
+- `straw_interfaces`（ament_cmake）— `StrawTarget.msg`。
+
+repo 根目錄的 `straw.py` 只是轉呼叫 package 內的正本，讓沒裝 ROS2 的電腦仍能 `python straw.py --image ...`。
+
+### 建置
+
+把整個 repo clone 進 workspace 的 `src/`。repo 根沒有 `package.xml`，colcon 會自己往下找到 `ros2/` 裡的兩個 package：
 
 ```bash
-python straw_ros2_node.py --ros-args \
-    -p image_topic:=/camera/camera/color/image_raw \
-    -p use_depth:=true \
-    -p min_confidence:=0.5
+cd ~/ros2_ws/src && git clone <repo> TDK-straw
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install
+source install/setup.bash
+```
 
+### 啟動
+
+```bash
+# 一行起完整 pipeline：realsense2_camera + straw_node
+ros2 launch straw_detector straw_with_camera.launch.py
+
+# 相機已經在跑，只起偵測節點
+ros2 launch straw_detector straw_detector.launch.py camera_namespace:=/camera/camera
+
+# 看結果
 ros2 topic echo /straw/target
 ```
 
-訊息為 `std_msgs/String` 承載 JSON，內容與 `--emit-json` 相同，另外多了 `stamp_sec` / `stamp_nanosec`（取自來源影像的 header，供控制端對時）。選 String 而非自訂訊息是為了免去 colcon build；要型別安全的版本，把 `publish_payload` 換成自訂 `.msg` 即可，其餘邏輯不必動。
+`straw_with_camera.launch.py` 會帶 `align_depth.enable:=true`（節點吃的是 `aligned_depth_to_color`，沒開的話那個話題不存在，會靜默地一則都收不到）與 `rgb_profile:=1280x720x30`（對上校正檔的 `image_width`）。
+
+參數集中在 `config/straw_detector.yaml`，launch 檔的 `params_file` 可換一份。話題名由 `camera_namespace` 組出，不必三個分別覆寫。
+
+### 訊息：`straw_interfaces/msg/StrawTarget`
+
+欄位與 `--emit-json` 的 JSON 一一對應，`header` 沿用來源影像的 header（stamp 與 frame_id）供控制端對時。
+
+| 欄位 | 說明 |
+|---|---|
+| `valid` | `false` 時以下欄位皆不可信，控制端應維持前一指令或停止 |
+| `reason` | `valid=false` 的原因：`no_detection` 或 `low_confidence` |
+| `heading_error_deg` | 角度誤差，正值代表目標頂端偏向畫面右側 |
+| `lateral_error_px` / `lateral_error_ratio` | 橫向誤差，像素與半畫面寬單位 |
+| `angle_deg` / `confidence` / `angle_sigma_deg` | 目標長軸角度、可信度、角度標準誤 |
+| `center_px` / `image_size` | 目標中心與來源影像大小 |
+| `has_depth` | `false` 時以下深度欄位皆為 0 |
+| `distance_m` / `lateral_error_m` | 目標距離、相對機器人瞄準軸的橫向位移（已補償安裝偏差） |
+| `camera_lateral_m` / `position_m` | 未補償的原始相機座標，校正與除錯用 |
+
+`low_confidence` 時 `confidence` 仍會填，其餘為 0。
+
+### 節點參數
 
 | 參數 | 預設 | 說明 |
 |---|---|---|
-| `image_topic` | `/camera/camera/color/image_raw` | 來源影像話題 |
-| `depth_topic` | `/camera/camera/aligned_depth_to_color/image_raw` | 對齊後的深度話題 |
-| `camera_info_topic` | `/camera/camera/color/camera_info` | 相機內參來源 |
+| `image_topic` / `depth_topic` / `camera_info_topic` | 由 launch 依 `camera_namespace` 組出 | 來源話題 |
 | `use_depth` | `true` | 是否訂閱深度並換算公尺座標 |
 | `depth_scale` | `0.001` | 深度單位換算（RealSense 為公釐） |
 | `depth_patch_radius` | `6` | 深度取樣的鄰域半徑（像素） |
@@ -296,15 +337,16 @@ ros2 topic echo /straw/target
 | `publish_annotated` | `false` | 是否發佈標註影像（關閉時會跳過繪圖） |
 | `min_confidence` | `0.5` | 低於此值視同沒有偵測到 |
 | `filter_alpha` | `0.25` | 跨影格軸線平滑係數 |
-| `calibration_file` | `""` | 校正檔路徑，見〈相機不在中軸線上〉 |
+| `use_calibration` | `true` | 關掉就不載入任何校正檔 |
+| `calibration_file` | `""` | 空字串代表 package 內 `config/axis_calibration.json` |
 | `lower_hsv` / `upper_hsv` / `kernel_size` / `min_area` | 同命令列 | 偵測參數 |
-| `robot_angle` / `axis_offset_m` / `axis_offset_ratio` / `axis_yaw_deg` | 同命令列 | 安裝偏差；被設成非預設值時會蓋過校正檔 |
+| `robot_angle` / `axis_offset_m` / `axis_offset_ratio` / `axis_yaw_deg` | 未設 | 安裝偏差；有設才蓋過校正檔，沒設一律以校正檔為準 |
 
 ### 兩個容易踩的坑
 
 **QoS 必須用 sensor data。** RealSense 以 `SensorDataQoS`（best effort）發佈影像；訂閱端若用 rclpy 預設的 reliable QoS，兩邊不相容，會**一則訊息都收不到，而且不會報錯**。本節點已使用 `qos_profile_sensor_data`。
 
-**話題名稱依 realsense-ros 版本而異。** 較新版本是 `/camera/camera/color/image_raw`（兩層 camera 命名空間），舊版是 `/camera/color/image_raw`。先用 `ros2 topic list` 確認，再用參數覆寫。
+**話題名稱依 realsense-ros 版本而異。** 較新版本是 `/camera/camera/color/image_raw`（兩層 camera 命名空間），舊版是 `/camera/color/image_raw`。先用 `ros2 topic list` 確認，再用 `camera_namespace` 覆寫。
 
 ---
 
@@ -457,8 +499,9 @@ ros2 topic echo /straw/target
 
 ## 檔案
 
-- `straw.py` — 偵測邏輯與命令列介面
-- `straw_ros2_node.py` — ROS2 節點，訂閱 RealSense 影像並發佈對準誤差
+- `straw.py` — 轉呼叫 `ros2/straw_detector/straw_detector/straw.py`，讓沒裝 ROS2 也能直接跑
+- `ros2/straw_detector/` — ROS2 package：`straw_detector/straw.py`（偵測邏輯與命令列介面的正本）、`straw_detector/detector_node.py`（ROS2 節點）、`launch/`、`config/`（參數 YAML 與校正檔）
+- `ros2/straw_interfaces/` — ROS2 package：`StrawTarget.msg`
 - `realsense_test.py` — 以 pyrealsense2 直連相機的串流測試，用來確認硬體正常；`--record` 可錄下素材
 - `data/` — 測試素材（影片檔不進版控）
 - `output/` — 程式產生的標註結果，不進版控

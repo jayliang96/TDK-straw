@@ -1,0 +1,30 @@
+# straw_node 的參數。話題名由 launch 檔依 camera_namespace 組出，不在這裡設。
+straw_detector:
+  ros__parameters:
+    use_depth: true
+    publish_annotated: false
+    target_topic: straw/target
+    annotated_topic: straw/annotated
+
+    # 可信度低於此值視同沒偵測到，寧可讓控制端維持前一個指令。
+    min_confidence: 0.5
+    # 跨影格軸線平滑，越小越平滑但反應越慢。
+    filter_alpha: 0.25
+
+    # RealSense z16 深度單位為毫米。
+    depth_scale: 0.001
+    depth_patch_radius: 6
+    # 彩色與深度時間戳的容許誤差（秒）。
+    sync_slop: 0.05
+
+    # HSV 色彩門檻與形態學參數，與 straw.py 的預設相同。
+    lower_hsv: [16, 84, 42]
+    upper_hsv: [33, 255, 255]
+    kernel_size: 11
+    min_area: 5000
+
+    # 相機安裝偏差預設從 package 內 config/axis_calibration.json 載入。
+    # 要蓋過校正檔才在這裡寫 robot_angle / axis_offset_m /
+    # axis_offset_ratio / axis_yaw_deg；沒寫的一律以校正檔為準。
+    use_calibration: true
+    calibration_file: ""
