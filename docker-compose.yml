@@ -17,5 +17,7 @@ services:
     environment:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
+      # 跟其他 container 用同一個 domain，DDS 才互相看得到話題。
+      - ROS_DOMAIN_ID=30
     stdin_open: true
     tty: true
