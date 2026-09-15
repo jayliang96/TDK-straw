@@ -15,7 +15,7 @@ pip install opencv-python numpy
 | 情境 | 額外相依 |
 |---|---|
 | `--realsense`（直連 RealSense） | `pyrealsense2` |
-| ROS2 節點（`ros2/` 下的 package） | ROS2 Humble 桌面版、`ros-humble-realsense2-camera`，見〈ROS2 package〉 |
+| ROS2 節點（`ros2/` 下的 package） | ROS2 Humble、`ros-humble-realsense2-camera`；或直接用 Docker，見〈ROS2 package〉 |
 
 ## 快速開始
 
@@ -35,8 +35,7 @@ python straw.py --realsense --robot | python robot_control.py
 
 影片與相機模式會開啟即時預覽視窗，按 `q` 或 `Esc` 結束。無頭環境加 `--no-display`。
 
-> `--image` 沒有可用的預設值（指向不存在的 `IMG_3231.JPEG`），圖片模式請明確指定路徑。
-> `data/*.MOV` 與 `data/*.mp4` 因體積過大不進版控，測試影片請自行放入 `data/`。
+> `--image` 沒有可用的預設值，圖片模式請明確指定路徑。`data/*.MOV` 與 `data/*.mp4` 因體積過大不進版控，測試影片請自行放入 `data/`。
 
 ---
 
@@ -54,42 +53,19 @@ python straw.py --realsense --robot | python robot_control.py
 
 ### RealSense 要用 `--realsense`，不能用 `--camera`
 
-OpenCV 的 UVC 路徑抓不到 RealSense 的彩色串流。D435 會註冊多個 UVC 節點，深度/紅外線那幾個 MSMF 能開啟卻取不到影格：
+OpenCV 的 UVC 路徑抓不到 RealSense 的彩色串流：D435 會註冊多個 UVC 節點，深度/紅外線那幾個 MSMF 能開啟卻取不到影格（`can't grab frame. Error: -1072875772`），換 index 或換 DSHOW 後端都無效。`--realsense` 改用 `pyrealsense2` 官方 SDK，順帶也拿得到深度與內參。
 
-```
-videoio(MSMF): can't grab frame. Error: -1072875772
-```
-
-換 index 或換 DSHOW 後端都無效。`--realsense` 改用 `pyrealsense2` 官方 SDK，順帶也拿得到深度與內參。
-
-```bash
-python straw.py --realsense --realsense-size 640 480 --realsense-fps 30
-```
+**務必插在 USB 3 埠。** D435 在 USB 2.x 模式下深度最高只到 640x480，預設的 1280x720 會啟動失敗（SDK 只會回報 `Couldn't resolve requests`）。本程式會偵測連線型態並在錯誤訊息中指出，此時改用 `--realsense-size 640 480` 可先跑起來 —— 但換解析度會動到校正，見〈兩個會靜靜出錯的地方〉。
 
 相機同時只能被一個程式佔用。若出現「影格逾時」，先確認 `realsense_test.py` 或其他程式沒有還開著。
 
-**務必插在 USB 3 埠。** D435 在 USB 2.x 模式下深度最高只到 640x480，預設的 1280x720 會啟動失敗（SDK 只會回報 `Couldn't resolve requests`）。本程式會偵測連線型態並在錯誤訊息中指出，此時改用 `--realsense-size 640 480` 可先跑起來。
-
 ### 錄一段素材
 
-相機不在手邊時要有東西可以重跑。`realsense_test.py --record` 會把當下的串流錄下來，副檔名決定錄什麼：
-
-```bash
-python realsense_test.py --record data/0908.mp4   # 只錄彩色，直接餵給 --video
-python realsense_test.py --record data/0908.bag   # 彩色+深度，一分鐘數百 MB
-```
-
-`.mp4` 存的是原始彩色影格，畫面上的 fps 疊字與右邊的深度併圖都不會進檔案，所以錄完可以直接 `python straw.py --video data/0908.mp4`。`.bag` 是 SDK 原生格式，深度留得住，但目前 `straw.py` 還沒有讀 bag 的輸入來源。
-
-掉格不會補格：串流掉幾格，錄出來的片長就比實際短幾格，收檔時會一起印出掉格數。
+相機不在手邊時要有東西可以重跑。`realsense_test.py --record data/0908.mp4` 會把當下的原始彩色串流錄下來，直接餵給 `--video`；副檔名改 `.bag` 連深度一起錄（一分鐘數百 MB，且 `straw.py` 還沒有讀 bag 的來源）。掉格不會補格，收檔時會印出掉格數。
 
 ### 影格新鮮度
 
-`--camera` 走 OpenCV 的 `VideoCapture`，驅動會累積影格佇列：實測在每輪處理耗時 100 ms 的情況下 `read()` 只花 **0.2 ms** 就回傳，代表拿到的是過期影格，且延遲會隨時間累積。因此相機來源預設以背景執行緒讀取，永遠處理最新的一格，舊格直接丟棄（`--no-frame-drop` 可關閉）。
-
-**`--realsense` 不套用這個機制。** RealSense 的 pipeline 本身就只保留最新的 frameset。實測端到端延遲（基準為 SDK 的 `time_of_arrival`）逐格處理中位 56.4 ms、丟格取最新 54.5 ms，差異在雜訊範圍內，且逐格模式的延遲並未累積 —— 多包一層只是增加複雜度。
-
-影片檔一律不丟格，丟格等於跳過內容。
+`--camera` 走 OpenCV 的 `VideoCapture`，驅動會累積影格佇列，拿到的是過期影格且延遲隨時間累積（實測處理耗時 100 ms 時 `read()` 只花 0.2 ms 就回傳）。因此相機來源預設以背景執行緒讀取，永遠處理最新的一格（`--no-frame-drop` 可關閉）。`--realsense` 不套用這個機制，RealSense 的 pipeline 本身就只保留最新的 frameset，實測延遲不累積。影片檔一律不丟格，丟格等於跳過內容。
 
 ---
 
@@ -150,11 +126,11 @@ python realsense_test.py --record data/0908.bag   # 彩色+深度，一分鐘數
 
 角度誤差範圍為 [-90, 90)，因為軸線沒有正反之分。`--robot-angle` 可改變機器人前進方向的定義，預設 90 度。
 
-### 控制端要注意的三件事
+### 控制端要注意的四件事
 
 1. **`valid: false` 不等於誤差為 0。** 沒有偵測到目標時應維持前一個指令或停止；把缺值當成 0 會讓機器人以為已經對準。
 2. **可信度要設門檻。** `IMG_4215.MOV` 全片 641 格中有 121 格（19%）可信度低於 0.3，多半是抓到被畫面切掉的碎片。`--robot` 預設以 0.5 過濾。
-3. **像素不是距離。** 同樣的像素偏移，目標越遠代表的實際偏移越大。有深度時直接用 `lateral_error_m`；沒有深度而只做閉迴路對中（把誤差收斂到 0），用 `lateral_error_ratio` 即可，不需要標定。
+3. **像素不是距離。** 同樣的像素偏移，目標越遠代表的實際偏移越大。有深度時直接用 `lateral_error_m`；沒有深度而只做閉迴路對中，用 `lateral_error_ratio` 即可，不需要標定。
 4. **相機沒裝在中軸線上就要校正。** 否則把誤差收斂到 0 只是讓相機對準稻草捆，機器人本身仍然偏著。見〈相機不在中軸線上〉。
 
 ---
@@ -171,9 +147,7 @@ python realsense_test.py --record data/0908.bag   # 彩色+深度，一分鐘數
 
 實測 12 個候選（6 樣本 × 2 種子）：正確解 0.64~0.98，錯誤解全為 0.00。
 
-種子項對競爭者有兩個條件。**指向不同軸線**：兩個種子經修正後收斂到同一個方向代表彼此印證，是最可靠的情況，不該被當成模稜兩可。**側邊長度相當**（至少為最佳解的 `DEFAULT_SEED_RIVAL_MIN_LENGTH`）：長方形的兩個方向都有直邊，圓柱側視時短軸的直線段佔比可達 0.775，與長軸的 0.925 接近；若不看長度，短軸會一直被誤判成勢均力敵的對手而無謂地壓低可信度。實測 `data/0908.mp4` 後段因此從 0.65 提升到 0.86。
-
-刻意**不使用**左右側邊夾角當懲罰項：稻草捆的兩側邊在透視下本來就會收斂，實測正確偵測的夾角（11~20 度）反而比錯誤偵測（2~11 度）更大，拿它當懲罰會壓低正確結果的分數。
+種子項的競爭者要**指向不同軸線**（兩個種子收斂到同一方向是彼此印證，不是模稜兩可）且**側邊長度相當**（至少為最佳解的 `DEFAULT_SEED_RIVAL_MIN_LENGTH`；圓柱側視時短軸的直線段佔比也很高，不看長度會一直被誤判成勢均力敵的對手）。刻意**不使用**側邊夾角當懲罰項：兩側邊在透視下本來就會收斂，實測正確偵測的夾角反而比錯誤偵測更大。
 
 ---
 
@@ -191,14 +165,10 @@ python realsense_test.py --record data/0908.bag   # 彩色+深度，一分鐘數
 
 有了 `lateral_error_m`，控制端就不必自己做相機標定，也不必處理「同樣的像素偏移在不同距離代表不同實際偏移」。
 
-兩個實作細節：
+- **深度必須與彩色對齊且時間同步**，否則會拿這一格的目標中心去查上一格的深度。`--realsense` 用 SDK 的 `rs.align`，ROS2 節點用 `ApproximateTimeSynchronizer`（容許誤差 `sync_slop`）。
+- **深度取鄰域中位數而非單一像素。** 反光、物體邊緣、超出量程都會讓單一像素的深度變成 0；取鄰域（半徑 `depth_patch_radius`）剔除 0 後取中位數，整塊都無效時回傳 `has_depth: false`。
 
-- **深度必須與彩色對齊且時間同步。** 兩個串流的時間戳不會完全相同；不同步的話會拿這一格的目標中心去查上一格的深度。`--realsense` 用 SDK 的 `rs.align`，ROS2 節點用 `ApproximateTimeSynchronizer`（容許誤差 `sync_slop`）。
-- **深度取鄰域中位數而非單一像素。** 反光、物體邊緣、超出量程都會讓單一像素的深度變成 0。取鄰域（半徑 `depth_patch_radius`）剔除 0 之後再取中位數穩定得多；整塊都無效時回傳 `has_depth: false`。
-
-反投影用的是相機**實際內參**而非假設光心在畫面正中央 —— 實測 D435 的 `cx = 651.9`，畫面中心是 640，兩者不同。
-
-深度不可用時（尚未取得內參、深度全為 0、轉換失敗）只會讓 `has_depth` 為 `false`，角度與像素誤差仍照常輸出，不構成單點故障。
+反投影用的是相機**實際內參**而非假設光心在畫面正中央 —— 實測 D435 的 `cx = 651.9`，畫面中心是 640。深度不可用時只會讓 `has_depth` 為 `false`，角度與像素誤差仍照常輸出，不構成單點故障。
 
 ---
 
@@ -230,9 +200,25 @@ python straw.py --realsense --robot
 
 這比量測相機的安裝位置好，不只是省事：它一次吸收 roll、偏航、鏡頭畸變、光心偏移，以及**夾爪相對機器人中心的偏移**。真正要問的問題不是「機器人中軸線在哪」，而是「稻草捆要出現在哪，夾爪才夾得到」—— 後者拿尺量不出來。量出來的參數仍是人看得懂的純文字，可以拿捲尺粗略核對，也可以手動編輯。
 
-RealSense 現場實測（1280x720，30 格全部可用）：軸線角度散佈 0.21 度、目標中心散佈 0.3 px。套用後 `--robot` 連續跑 119 格，角度誤差 **±0.09 度**、`lateral_error_m` **±0.0004 m**，且公尺與 ratio 兩條路徑同時歸零。參數的絕對值每次重新安裝或重新定義正確姿態都會變，重跑校正即可。
+校正只收可信度過門檻的影格（同 `--min-confidence`），取中位數而非平均，**離散度過大就拒絕寫檔** —— 一個看似合理的壞校正會讓之後每一格都偏，而且不會有任何徵兆。RealSense 現場實測（1280x720，30 格全部可用）軸線角度散佈 0.21 度、目標中心散佈 0.3 px；套用後 `--robot` 連續跑 119 格，角度誤差 **±0.09 度**、`lateral_error_m` **±0.0004 m**，公尺與 ratio 兩條路徑同時歸零。參數的絕對值每次重新安裝或重新定義正確姿態都會變，重跑校正即可。
 
-校正只收可信度過門檻的影格（同 `--min-confidence`），取中位數而非平均，**離散度過大就拒絕寫檔** —— 一個看似合理的壞校正會讓之後每一格都偏，而且不會有任何徵兆。實測取 `data/09081.mp4` 最後 30 秒會涵蓋接近過程，角度散佈 15.1 度而被擋下。
+### 在容器裡校正
+
+節點本身沒有校正模式，校正一律走 CLI。相機同時只能被一個程式開啟，所以要先把 launch 停掉（終端 1 按 Ctrl-C 即可，容器可以留著），再進容器把結果**直接寫進 package 的正本**：
+
+```bash
+docker compose exec straw /entrypoint.sh bash
+
+cd /ws/src/TDK-straw
+python3 straw.py --realsense --no-display \
+    --calibrate ros2/straw_detector/config/axis_calibration.json
+```
+
+**寫完不必重 build。** `--symlink-install` 讓 `install/straw_detector/share/straw_detector/config/axis_calibration.json` 一路連回 `/ws/src/TDK-straw/ros2/straw_detector/config/`，而那裡就是主機上的 repo（bind mount，且容器以主機相同 UID 執行），校正完在主機 `git diff` 就看得到新舊差異。重起 launch 後 log 會印出 `讀入校正檔: ...`，在校正姿態下 `/straw/target` 的 `heading_error_deg` 與 `lateral_error_m` 都該貼著 0。
+
+兩件別做的事：**不要寫到 `/ws/install/` 底下**，也不要在 `config/` 新增檔名不同的校正檔 —— `setup.py` 用的是 build 時展開的 `glob("config/*")`，新檔案要重 build 才會被安裝，覆寫既有的 `axis_calibration.json` 才是免 build 的路徑。**不要改 `--realsense-size`**，預設的 1280x720 正好對上 `straw_with_camera.launch.py` 的 `rgb_profile`。
+
+拿影片或參考圖校正沒有相機佔用的問題，launch 可以繼續跑。
 
 ### 兩個會靜靜出錯的地方
 
@@ -240,19 +226,11 @@ RealSense 現場實測（1280x720，30 格全部可用）：軸線角度散佈 0
 
 **瞄準軸在畫面上是斜的，不是垂直線。** 它是一條與機器人前進方向平行的 3D 直線，投影後朝消失點收斂，影像角度就是 `robot_angle`。這不只是畫面問題：`lateral_error_px` 量的是目標中心到瞄準軸的水平距離，拿垂直線去量會有 `Δy × 斜率` 的偏差（84.4 度時斜率 0.097，上下差 200 px 就差 19 px）。因此校正檔存下瞄準軸通過的點 `aim_center_px`，執行時在目標所在的高度上量。`lateral_error_m` 在 3D 座標裡算，不受影響。
 
-同一件事的另一面是**「應有的角度」取決於目標在畫面上的位置**：所有與前進方向平行的 3D 線都交於同一個消失點，應有角度就是「從目標中心指向消失點」的方向。
-
-| 目標中心的位置 | 用固定 `robot_angle` 的誤差 |
-|---|---|
-| 沿瞄準軸前後移動（橫向已對準） | **−0.03 度，任何距離都不變** |
-| 橫向偏離 ±150 px | ±5.1 度 |
-| 橫向偏離 ±300 px | ±10.2 度 |
-
-**橫向對準之後，固定的 `robot_angle` 在任何距離都精確** —— 目標中心是沿著一條通過消失點的直線靠近，指向消失點的方向不變。誤差只在還沒對準時出現，並隨橫向誤差收斂而消失。實務上：橫向誤差還大時 `heading_error_deg` 有系統性偏差（每 100 px 約 3.4 度），不該拿它大力轉向；**先收橫向、再修角度**的順序天生避開這個問題。
+同一件事的另一面是**「應有的角度」取決於目標在畫面上的位置**：所有與前進方向平行的 3D 線都交於同一個消失點，應有角度就是「從目標中心指向消失點」的方向。用固定 `robot_angle` 時，沿瞄準軸前後移動的誤差是 −0.03 度（任何距離都不變），橫向每偏離 150 px 則多 5.1 度。也就是**橫向對準之後，固定的 `robot_angle` 在任何距離都精確**；誤差只在還沒對準時出現（每 100 px 約 3.4 度），因此**先收橫向、再修角度**的順序天生避開這個問題。
 
 ### 為什麼參數存的是公尺
 
-相機往右偏 `d` 公尺時，瞄準軸投影到畫面上的位置是 `cx - fx·d/Z` —— **隨目標距離變動**。D435 彩色在 1280 寬下 `fx` 約 900，取 `d` = 10 cm：1 m 處偏 90 px、2 m 處剩 45 px、3 m 處剩 30 px。在 1 m 校正好的固定像素補償，拉到 2 m 就錯 45 px（半畫面寬的 7%）。
+相機往右偏 `d` 公尺時，瞄準軸投影到畫面上的位置是 `cx - fx·d/Z` —— **隨目標距離變動**。D435 彩色在 1280 寬下 `fx` 約 900，取 `d` = 10 cm：1 m 處偏 90 px、2 m 處剩 45 px。在 1 m 校正好的固定像素補償，拉到 2 m 就錯 45 px（半畫面寬的 7%）。
 
 因此有深度時走 `axis_offset_m`，直接在公尺座標裡補償，與距離無關。側偏是**加**不是減：相機在軸線右側 10 cm 時，稻草捆落在畫面正中央代表它其實也在軸線右側 10 cm。`axis_offset_m` 與 `axis_offset_ratio` 由同一次校正一起產生，因此在校正距離上必定一致 —— 深度掉格時控制端在兩個欄位之間切換不會看到跳變。
 
@@ -305,18 +283,37 @@ repo 以 bind mount 掛在 `/ws/src/TDK-straw`，跟 build 時同一路徑，`--
 
 ### 啟動
 
+平常只需要兩個終端。每個終端都先 `docker compose exec straw /entrypoint.sh bash` 進容器（容器沒在跑就先 `docker compose up -d straw`，見上一節）。
+
 ```bash
-# 一行起完整 pipeline：realsense2_camera + straw_node
+# 終端 1：一行起完整 pipeline：realsense2_camera + straw_node
 ros2 launch straw_detector straw_with_camera.launch.py
+# 要看預覽視窗（主機先 xhost +local:docker）
+ros2 launch straw_detector straw_with_camera.launch.py publish_annotated:=true
 
-# 相機已經在跑，只起偵測節點
-ros2 launch straw_detector straw_detector.launch.py camera_namespace:=/camera/camera
-
-# 看結果
+# 終端 2：看結果（network_mode: host，主機端有裝 ROS2 的話也能直接下）
 ros2 topic echo /straw/target
 ```
 
-`straw_with_camera.launch.py` 會帶 `align_depth.enable:=true`（節點吃的是 `aligned_depth_to_color`，沒開的話那個話題不存在，會靜默地一則都收不到）與 `rgb_profile:=1280x720x30`（對上校正檔的 `image_width`）。
+`straw_with_camera.launch.py` 會帶 `align_depth.enable:=true`（節點吃的是 `aligned_depth_to_color`，沒開的話那個話題不存在，會靜默地一則都收不到）與 `rgb_profile:=1280x720x30`（對上校正檔的 `image_width`），再 include `straw_detector.launch.py` 起偵測節點。
+
+**`straw_detector.launch.py` 是給相機已經另外起了的情況**，例如排查問題時手動跑了 `rs_launch.py`，這時只補偵測節點：
+
+```bash
+ros2 launch straw_detector straw_detector.launch.py
+```
+
+它和 `straw_with_camera.launch.py` 是二選一。若前者已在跑又下這條，會多出第二個 `straw_detector` 節點，兩個一起往 `/straw/target` 發，每格出現兩次。
+
+| 情況 | 做法 |
+|---|---|
+| 舊版 realsense-ros，`ros2 topic list` 只有一層 `/camera/...` | 任一條 launch 加 `camera_namespace:=/camera` |
+| 單獨起相機排查 | `ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true rgb_camera.color_profile:=1280x720x30` |
+| 不經 ROS 直接測相機 | `python3 realsense_test.py`，看到 `USB 3.2`、`30.0 fps` 就正常，按 ESC 離開 |
+
+起不來時先看：相機是否插在 USB 3 埠（log 出現 `Couldn't resolve requests` 就是 USB 2）、有沒有別的程式還佔著相機（`realsense_test.py`、`straw.py --realsense`、另一個 launch）。再深入走〈測試 RealSense 節點〉的四關。
+
+相機硬體只能被一個程式開啟，那個程式就是 `realsense2_camera`；它發出的話題要幾個節點訂閱都行。要再加訂閱影像的節點，QoS 一樣得用 `qos_profile_sensor_data`（見〈兩個容易踩的坑〉），且每個節點各自解碼一份 1280x720@30，CPU 是加總的 —— 只需要偵測結果的節點請訂閱 `/straw/target`，不要各自重跑偵測。
 
 參數集中在 `config/straw_detector.yaml`，launch 檔的 `params_file` 可換一份。話題名由 `camera_namespace` 組出，不必三個分別覆寫。
 
@@ -373,7 +370,7 @@ ros2 topic echo /straw/target
 python3 realsense_test.py
 ```
 
-要看到 `以 USB 3.2 連線`、`1280x720@30 彩色+深度：可用`，視窗左上 `30.0 fps  dropped 0`。印出 `USB 2.x` 就換埠或換線。看完**按 ESC 離開**，不要 Ctrl-C，讓它正常走 `pipeline.stop()`（見下方「Depth stream start failure」）。
+要看到 `以 USB 3.2 連線`、`1280x720@30 彩色+深度：可用`，視窗左上 `30.0 fps  dropped 0`。印出 `USB 2.x` 就換埠或換線。看完**按 ESC 離開**，不要 Ctrl-C，讓它正常走 `pipeline.stop()`。
 
 **第 2 關：單獨起 realsense node。**
 
@@ -385,7 +382,7 @@ log 要有 `Device USB type: 3.2`、`Open profile: ... Color ... 1280x720 ... 30
 
 - `Couldn't resolve requests`：USB 2 模式撐不起 1280x720。
 - `No RealSense devices were found`：第 1 關的程式還開著，或容器沒掛 `/dev`。
-- 啟動後一次 `Hardware Notification: Depth stream start failure`：深度模組卡在上一次沒乾淨收掉的狀態。SDK 通常會自己重試成功，用第 3 關的 `hz` 確認深度有在出即可；沒有的話加 `initial_reset:=true` 重起，再不行就實體重插相機。
+- 一次性的 `Hardware Notification: Depth stream start failure`：深度模組卡在上一次沒乾淨收掉的狀態，SDK 通常會自己重試成功，用第 3 關的 `hz` 確認深度有在出即可；沒有的話加 `initial_reset:=true` 重起，再不行就實體重插相機。
 
 **第 3 關：確認話題真的有資料在流。** 另開一個終端：
 
@@ -411,15 +408,9 @@ ros2 topic echo /straw/target          # 另一個終端
 鏡頭前放目標物，要看到 `valid: true`、`has_depth: true`、`distance_m` 接近實際距離；拿開後變 `valid: false`、`reason: no_detection`。
 
 - `/straw/target` 一則都沒有：`aligned_depth_to_color` 沒出來（回第 3 關），或 `camera_namespace` 跟實際話題名不符。
-- `valid: true` 但 `has_depth: false`：訊息有發代表彩色與深度都有同步收到，剩下兩種可能——log 沒有 `取得內參 fx=...`（`camera_info` 話題名不對），或目標中心鄰域的深度全是 0。後者最常見的原因是**目標離相機不到 0.3 m**（D435 深度的最短量程），其次是螢幕、照片、光滑反光面或無紋理平面。
+- `valid: true` 但 `has_depth: false`：訊息有發代表彩色與深度都有同步收到，剩下兩種可能 —— log 沒有 `取得內參 fx=...`（`camera_info` 話題名不對），或目標中心鄰域的深度全是 0。後者最常見的原因是**目標離相機不到 0.3 m**（D435 深度的最短量程），其次是螢幕、照片、光滑反光面或無紋理平面。
 
-**用預覽視窗看深度。** `has_depth` 為什麼是 false 用 CLI 看最快，它與節點共用同一套 `build_depth_fields`，判斷完全一致。先關掉 ROS 端的 launch，再：
-
-```bash
-python3 straw.py --realsense
-```
-
-終端每格印一行，有 `距離: 0.812 m` 就是深度取到了，沒有就是那一塊沒有有效深度；一邊移動目標一邊看距離什麼時候出現，就能分辨是太近還是表面問題。`--emit-json` 改印與 `StrawTarget` 同欄位的 JSON。用 `q` 或 `Esc` 結束，不要 Ctrl-C。
+深度為什麼取不到，用 CLI 看最快（它與節點共用同一套 `build_depth_fields`，判斷完全一致）：關掉 ROS 端的 launch，跑 `python3 straw.py --realsense`，終端每格印一行，有 `距離: 0.812 m` 就是深度取到了。一邊移動目標一邊看距離什麼時候出現，就能分辨是太近還是表面問題。
 
 ---
 
@@ -495,17 +486,13 @@ python3 straw.py --realsense
 
 **側邊向量相加，而非單邊或外接矩形。** 透視會讓稻草捆的矩形投影成梯形，兩側邊各自傾斜的方向相反，相加可抵消大部分透視偏移。
 
-**剔除貼齊畫面邊界的輪廓點。** 目標超出畫面時，輪廓會沿影像邊界走一整段完美直線。那是裁切痕跡不是稻草邊緣，而 RANSAC 天生偏好這種零殘差的直線，不剔除就會擬出一條沿著畫面邊緣的假側邊。剔除範圍由 `DEFAULT_BORDER_MARGIN`（2 px）控制。
+**剔除貼齊畫面邊界的輪廓點。** 目標超出畫面時，輪廓會沿影像邊界走一整段完美直線 —— 那是裁切痕跡不是稻草邊緣，而 RANSAC 天生偏好這種零殘差的直線，不剔除就會擬出一條沿著畫面邊緣的假側邊。剔除範圍由 `DEFAULT_BORDER_MARGIN`（2 px）控制。
 
 **取最長連續內點區段，而非全部內點。** 圓柱體兩端是圓弧，位於邊界點序列的頭尾。圓弧會持續偏離直線，不可能落在連續內點區段內，因此自然被截掉；只取內點則可能讓兩端圓弧「擦過」直線，形成中間夾著圓弧的假直邊。
 
-**側邊夾角過大就否決。** 目標只露出一小截時，兩條線可能都擬在同一段端點圓弧上，成為該弧的兩條切線 —— 此時夾角會遠大於透視造成的收斂。真實的兩條側邊接近平行，實測正常情形（含透視）不超過 30 度，因此夾角超過 `DEFAULT_MAX_SIDE_ANGLE_DIFFERENCE`（45 度）就判定該種子方向失敗，改用另一個候選。全片 641 格實測：16 格觸發此守門，其中 2 格原本會以 0.64 / 0.57 的可信度送出錯誤約 90 度的角度。
+**側邊夾角過大就否決。** 目標只露出一小截時，兩條線可能都擬在同一段端點圓弧上，成為該弧的兩條切線 —— 此時夾角會遠大於透視造成的收斂。實測正常情形不超過 30 度，因此超過 `DEFAULT_MAX_SIDE_ANGLE_DIFFERENCE`（45 度）就判定該種子方向失敗，改用另一個候選。這與「可信度不看夾角」不衝突：守門是物理合理性的硬性否決，可信度則是正常範圍內的漸進評分。
 
-這與「可信度不看夾角」並不衝突：守門是物理合理性的硬性否決（>45 度不可能是兩側邊），可信度則是正常範圍內的漸進評分，而在該範圍內夾角大反而代表擬到了真正的側邊。
-
-**種子方向會反覆修正。** 種子只用來決定分箱的縱向座標。目標只露出一小截時 mask 接近方形，PCA 主軸可能偏離真實長軸數十度，導致左右邊界都落在同一側 —— 實測有一張圖的兩側中點只相距 14 px，而目標寬度是 260 px。用上一輪算出的方向重新分箱可以逐步修正（`data/0908.png`：44.7 度 → 69.7 度 → 74.5 度，可信度 0.07 → 0.64，中心從偏離 106 px 修正到 15 px）。直線段佔比已達 `DEFAULT_STRAIGHT_TARGET` 就提早停止，因此本來就擬得好的影格不必多花時間。
-
-這不是 mask 鋸齒造成的：對同一張圖做高斯模糊平滑邊緣（sigma 2/5/9），各種子方向的結果幾乎逐字相同。
+**種子方向會反覆修正。** 種子只用來決定分箱的縱向座標。目標只露出一小截時 mask 接近方形，PCA 主軸可能偏離真實長軸數十度，導致左右邊界都落在同一側；用上一輪算出的方向重新分箱可以逐步修正（`data/0908.png`：44.7 → 74.5 度，可信度 0.07 → 0.64）。直線段佔比已達 `DEFAULT_STRAIGHT_TARGET` 就提早停止。
 
 **主軸與次軸都試一次。** 目標接近方形時 PCA 分不出長短軸，主軸可能剛好指向側邊的垂直方向，導致側邊擬成上下兩端（90 度翻轉）。兩個方向各擬合一次取較佳者，並用兩者的分數差距當作可信度的一項證據。
 
@@ -519,14 +506,10 @@ python3 straw.py --realsense
 | 紅色圓點 | 估計的目標中心 |
 | **橘色**雙向箭頭 | 長軸方向，且**可信度通過門檻** —— 這一格會被控制端採用 |
 | **灰色**雙向箭頭 | 長軸方向，但可信度未達門檻 —— 這一格會被丟棄 |
-| 綠色斜線 | 機器人瞄準軸；橫線標出目標中心離它的位移。斜率來自 `robot_angle`，因為瞄準軸投影後朝消失點收斂，未校正時為垂直 |
+| 綠色斜線 | 機器人瞄準軸；橫線標出目標中心離它的位移。斜率來自 `robot_angle`，未校正時為垂直 |
 | 細灰色垂直線 | 畫面中線，只在瞄準軸被安裝偏差移開或傾斜時才畫，用來看補償了多少 |
 
-軸線兩端無正反之分，故兩端皆有箭頭；一律描深色外框，才能在同樣是橘色的目標區塊上看清楚。
-
-判定用的門檻取自 `--min-confidence`；該值為 0（非機器運行模式的預設，代表不過濾輸出）時，標註圖改用 `DEFAULT_MIN_CONFIDENCE`（0.5），否則每一格都會顯示通過而失去意義。文字列會同時標出可信度、門檻與通過與否。
-
-### 人類可讀輸出
+軸線兩端無正反之分，故兩端皆有箭頭。判定用的門檻取自 `--min-confidence`；該值為 0（非機器運行模式的預設）時標註圖改用 `DEFAULT_MIN_CONFIDENCE`（0.5），否則每一格都會顯示通過而失去意義。
 
 單張圖片模式另外會印出診斷用的中間量：目標面積、兩側邊估計長度、主軸細長比、輪廓貼齊畫面邊界比例、側邊直線段佔比、角度標準誤、可信度三細項。
 
@@ -545,11 +528,7 @@ python3 straw.py --realsense
 | **整體** | **46~49 ms（約 21 fps）** |
 | **`--robot`（不繪圖）** | **34.0 ms（29.4 fps）** |
 
-**降低輸入解析度幾乎沒有幫助。** 只有前兩個階段隨像素數縮放；側邊擬合處理的是 40 個切片點，與解析度無關。640x360 只快約 1.4 倍。
-
-**主軸用二階中央動差求，不展開像素座標。** 主軸只是找側邊的初始方向。原本用 `np.column_stack(np.where(mask > 0))` 把十幾萬個前景像素的座標展開成陣列再做 PCA —— 展開就花 6.6 ms，而 PCA 本身只要 0.5 ms。改用 `cv2.moments` 在影像上直接累加二階動差，數學上等價（實測主軸角度差 0.000 度），成本 3.3 ms。
-
-**RANSAC 已向量化。** 取樣迴圈改為矩陣運算一次算完所有候選，`analyze_target` 因此快了 4.3 倍。300 次迭代在向量化後成本很低，故保留此值以維持最大餘裕（理論上內點率 0.5 時 24 次即可 99.9% 收斂）。
+**降低輸入解析度幾乎沒有幫助。** 只有前兩個階段隨像素數縮放；側邊擬合處理的是 40 個切片點，與解析度無關，640x360 只快約 1.4 倍。要省時間就關繪圖（`--robot`）。
 
 ---
 
@@ -557,11 +536,9 @@ python3 straw.py --realsense
 
 目標貼齊畫面邊界時仍未處理完的部分（`IMG_4215.MOV` 全片 641 格實測）：
 
-- **目標選取仍以純面積排序。** 有 70 格的最大連通區是被畫面切掉的碎片（例如 230k px 的角落三角形），而畫面中另有完整可見的稻草捆（67k px）被忽略。改進方向是把排序改成 `面積 × 完整度權重`，讓重度截斷的元件失去優先權。
-- **沒有單邊退化模式。** 目前只要有一側擬合失敗就整格放棄。實際上單側仍可提供方向（可信度打折），只是中心不可求 —— 物體真正的中心可能在畫面外，用可見部分的形心冒充會系統性偏移。
-- **未區分縱向與橫向截斷。** 端點被切時兩條側邊仍完好，方向可用，只有長度是下限；側邊被切才會真正破壞方向。兩者目前一視同仁。
+- **目標選取仍以純面積排序。** 有 70 格的最大連通區是被畫面切掉的碎片（例如 230k px 的角落三角形），而畫面中另有完整可見的稻草捆（67k px）被忽略。改進方向是把排序改成 `面積 × 完整度權重`。
+- **沒有單邊退化模式。** 目前只要有一側擬合失敗就整格放棄。實際上單側仍可提供方向（可信度打折），只是中心不可求。
 - **種子方向未利用時間資訊。** 截斷時 PCA 會亂跳，可改用上一格的平滑角度當種子（並在與 PCA 差距過大時回退，避免濾波器鎖死在錯誤角度）。
-- **結果對種子方向的正負號敏感。** 軸線沒有正反之分，但種子的正負號會決定哪一側被稱為「左」，進而影響修正的收斂路徑。實測全片 641 格中有 213 格會因為這個任意符號而得到不同結果，最大軸線差 27.4 度。把四個方向（±主軸、±次軸）都試可讓通過格數從 481 增至 487，但成本增加 33%（38.4 → 51.1 ms），暫不採用。
 - **低可信度的影格仍會進入軸線濾波器。** `AxisAngleFilter` 不會拒絕錯誤的偵測，只會把它慢慢混進輸出。可信度門檻目前只擋輸出，不擋濾波器更新。
 
 安裝偏差校正的部分（見〈相機不在中軸線上〉）：
